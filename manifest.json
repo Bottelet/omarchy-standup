@@ -1,0 +1,37 @@
+{
+  "schemaVersion": 1,
+  "id": "bottelet.standup",
+  "name": "Standup",
+  "version": "1.0.0",
+  "author": "Casper Bottelet",
+  "license": "MIT",
+  "description": "Generates a short daily standup from the git activity across all your project folders, on a schedule you set, using your default Omarchy coding agent (or any local model). Bar icon badges when a new standup is waiting.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Standup",
+    "description": "Bullhorn icon that badges when a fresh standup has been generated from your recent commits",
+    "category": "Productivity",
+    "allowMultiple": false,
+    "defaults": {
+      "roots": "~/Projects",
+      "scanDepth": 2,
+      "windowMode": "auto",
+      "days": 1,
+      "authorMode": "me",
+      "authors": "",
+      "format": "bullets",
+      "formatText": "",
+      "agent": "default",
+      "customCommand": "",
+      "autoGenerate": true,
+      "scheduleTime": "09:00",
+      "scheduleDays": "mon,tue,wed,thu,fri",
+      "maxBullets": 5
+    }
+  }
+}

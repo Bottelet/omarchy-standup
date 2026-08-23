@@ -1,0 +1,44 @@
+MIT License
+
+Copyright (c) 2026 Casper Bottelet
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+---
+
+External dependencies and services
+==================================
+
+Command-line tools (all ship with a stock Omarchy install): curl, jq, sleep,
+head (coreutils), sh.
+
+Network services contacted over HTTPS (read-only GET/POST of public data;
+no credentials required):
+  - OSV.dev            https://api.osv.dev              (framework/library CVEs)
+  - NVD API 2.0        https://services.nvd.nist.gov     (runtime/product CVEs)
+  - CISA KEV feed      https://www.cisa.gov              (exploited-in-the-wild)
+  - endoflife.date     https://endoflife.date            (EOL / latest patch)
+
+An optional user-supplied NVD API key (stored in this plugin's own settings)
+is sent only to services.nvd.nist.gov.
+
+Privilege boundary: the plugin makes outbound HTTPS requests, opens advisory
+URLs in the user's browser via xdg-open, and persists settings only to its own
+entry in ~/.config/omarchy/shell.json. It does not modify any other user
+configuration.
