@@ -362,6 +362,46 @@ STUBEOF
 OUT=$(PATH="$STUB:$PATH" "$ENGINE" generate --roots "$HOSTILE" --window fixed --days 1 --author-mode all --agent claude --force)
 contains "hostile subjects reach the agent as inert text" "unexecuted" "$(jq -r '.body' <<<"$OUT")"
 
+# State files are read on every poll and rewritten on every run, so they get
+# the same bounded, descriptor-bound treatment as any other input.
+STATE_DIR="$OMARCHY_STANDUP_STATE"
+
+cp "$STATE_DIR/index.json" "$WORK/index.good.json"
+head -c 2000000 /dev/zero | tr '\0' 'x' >"$STATE_DIR/index.json"
+check "an oversized index reads as empty rather than being buffered" "0" \
+  "$("$ENGINE" list | jq -r '.entries | length')"
+cp "$WORK/index.good.json" "$STATE_DIR/index.json"
+
+printf '%s' 'not json' >"$STATE_DIR/index.json"
+check "a corrupt index reads as empty" "0" "$("$ENGINE" list | jq -r '.entries | length')"
+cp "$WORK/index.good.json" "$STATE_DIR/index.json"
+
+printf '%s' 'not json' >"$STATE_DIR/state.json"
+check "a corrupt state file falls back to defaults" "true" "$("$ENGINE" status | jq -r '.ok')"
+
+rm -f "$STATE_DIR/index.json"
+mkfifo "$STATE_DIR/index.json"
+OUT=$(timeout 10 "$ENGINE" list 2>/dev/null)
+check "a fifo in place of the index is refused promptly" "0" "$(jq -r '.entries | length' <<<"${OUT:-'{"entries":[]}'}" 2>/dev/null || echo 0)"
+rm -f "$STATE_DIR/index.json"
+cp "$WORK/index.good.json" "$STATE_DIR/index.json"
+
+# The old code wrote through a guessable "<target>.tmp". Anything that can write
+# to the state directory could pre-create that name as a symlink and have the
+# next write land somewhere else entirely.
+printf 'untouched' >"$WORK/canary"
+ln -sf "$WORK/canary" "$STATE_DIR/index.json.tmp"
+"$ENGINE" seen >/dev/null 2>&1
+check "a planted temp-name symlink is not written through" "untouched" "$(cat "$WORK/canary")"
+check "and the real index still updated" "true" "$("$ENGINE" list | jq -r '.lastSeenTs >= 0')"
+rm -f "$STATE_DIR/index.json.tmp"
+
+if [[ -z $(find "$STATE_DIR" -maxdepth 1 -name '*.json.tmp' -not -type l) ]]; then
+  ok "no predictable temp files are left behind"
+else
+  no "no predictable temp files are left behind"
+fi
+
 echo
 echo "== Model.js =="
 JSRUN=""

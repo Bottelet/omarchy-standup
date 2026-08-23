@@ -28,6 +28,13 @@ AGENT_TIMEOUT="${OMARCHY_STANDUP_AGENT_TIMEOUT:-240}"
 # agent, and a command substitution has no size limit of its own.
 MAX_AGENT_BYTES=65536
 MAX_SCAN_BYTES=4000000
+# State files are read on every status poll and every generate. They live in
+# the user's own directory, but they are still files this script did not open
+# with its own hands each time, so they get the same treatment as any other
+# input: a bounded read that cannot be redirected by a swap.
+MAX_INDEX_BYTES=1048576
+MAX_STATE_BYTES=65536
+MAX_ENTRY_BYTES=262144
 
 log() { printf '%s %s\n' "$(date -Is)" "$*" >>"$LOG_FILE" 2>/dev/null; }
 
@@ -37,13 +44,88 @@ die() {
   exit 1
 }
 
+# Reads a file through a single descriptor with a hard ceiling.
+#
+# Type and owner are checked on the open descriptor rather than re-checked by
+# pathname, so replacing the file between the check and the read cannot change
+# what was validated. The type is also checked before the open, because opening
+# a fifo blocks until a writer appears and would hang the caller before any
+# descriptor check could run.
+read_bounded() { # read_bounded <path> <max-bytes>
+  local path=$1 max=$2 fd info kind owner content bytes
+  [[ -e $path ]] || return 1
+  if [[ $(stat -c '%u' "$path" 2>/dev/null) != "$UID" ]]; then
+    log "refused, not owned by this user: $path"
+    return 1
+  fi
+  if [[ ! -f $path ]]; then
+    log "refused, not a regular file: $path"
+    return 1
+  fi
+  # Braces matter: a bare `exec ... 2>/dev/null` would point this shell's
+  # stderr at /dev/null for good.
+  if ! { exec {fd}<"$path"; } 2>/dev/null; then
+    log "refused, cannot open: $path"
+    return 1
+  fi
+  info=$(stat -L -c '%F|%u' "/proc/self/fd/$fd" 2>/dev/null)
+  kind=${info%%|*}
+  owner=${info##*|}
+  if [[ $kind != "regular file" || $owner != "$UID" ]]; then
+    exec {fd}<&-
+    log "refused, descriptor is not a regular file owned by this user: $path"
+    return 1
+  fi
+  content=$(head -c $((max + 1)) <&"$fd")
+  exec {fd}<&-
+  bytes=$(printf '%s' "$content" | wc -c)
+  if ((bytes > max)); then
+    log "refused, larger than $max bytes: $path"
+    return 1
+  fi
+  printf '%s' "$content"
+}
+
+# Replaces a file atomically without ever writing through a planted symlink.
+# The temp name comes from mktemp rather than a guessable "<target>.tmp", which
+# anything with write access to the directory could pre-create as a link.
+write_atomic() { # write_atomic <path>   (content on stdin)
+  local path=$1 dir tmp
+  dir=$(dirname "$path")
+  tmp=$(mktemp "$dir/.tmp.XXXXXXXX" 2>/dev/null) || return 1
+  chmod 600 "$tmp" 2>/dev/null
+  if ! cat >"$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  mv -f "$tmp" "$path"
+}
+
+# A missing, refused or corrupt file reads as the empty document rather than
+# taking the caller down with it.
+read_index() {
+  local raw
+  raw=$(read_bounded "$INDEX_FILE" "$MAX_INDEX_BYTES") || raw=""
+  printf '%s' "$raw" | jq -e 'type == "object"' >/dev/null 2>&1 ||
+    raw='{"entries":[],"lastSeenTs":0}'
+  printf '%s' "$raw"
+}
+
+read_state() {
+  local raw
+  raw=$(read_bounded "$STATE_FILE" "$MAX_STATE_BYTES") || raw=""
+  printf '%s' "$raw" | jq -e 'type == "object"' >/dev/null 2>&1 ||
+    raw='{"lastRunTs":0,"lastRunUntil":"","lastStatus":"","running":false}'
+  printf '%s' "$raw"
+}
+
 ensure_dirs() {
   mkdir -p "$ENTRIES_DIR" || return 1
   # Commit subjects across every project the user works on: not a secret, but
   # not everyone-on-the-box readable either.
   chmod 700 "$STATE_DIR" 2>/dev/null
-  [[ -f $INDEX_FILE ]] || printf '%s\n' '{"entries":[],"lastSeenTs":0}' >"$INDEX_FILE"
-  [[ -f $STATE_FILE ]] || printf '%s\n' '{"lastRunTs":0,"lastRunUntil":"","lastStatus":"","running":false}' >"$STATE_FILE"
+  [[ -f $INDEX_FILE ]] || printf '%s\n' '{"entries":[],"lastSeenTs":0}' | write_atomic "$INDEX_FILE"
+  [[ -f $STATE_FILE ]] || printf '%s\n' '{"lastRunTs":0,"lastRunUntil":"","lastStatus":"","running":false}' | write_atomic "$STATE_FILE"
 }
 
 expand_home() {
@@ -139,7 +221,7 @@ resolve_window() {
   floor=$(date -Is -d "$MAX_WINDOW_DAYS days ago")
   if [[ $mode == auto ]]; then
     local last=""
-    [[ -f $STATE_FILE ]] && last=$(jq -r '.lastRunUntil // ""' "$STATE_FILE" 2>/dev/null)
+    last=$(read_state | jq -r '.lastRunUntil // ""' 2>/dev/null)
     if [[ -n $last && $last != null ]]; then
       # Clamp: coming back from two weeks off should not dump a fortnight of
       # commits into a standup meant to be read in ten seconds.
@@ -512,7 +594,7 @@ cmd_generate() {
     die "a standup is already being generated"
   fi
 
-  jq -c '.running = true | .lastStatus = "collecting"' "$STATE_FILE" >"$STATE_FILE.tmp" && mv "$STATE_FILE.tmp" "$STATE_FILE"
+  read_state | jq -c '.running = true | .lastStatus = "collecting"' | write_atomic "$STATE_FILE"
 
   local digest
   digest=$(collect_json "$roots" "$depth" "$mode" "$days" "$explicit" "$author_mode" "$authors")
@@ -558,7 +640,7 @@ cmd_generate() {
     [[ -n $resolved ]] || resolved=""
   fi
 
-  jq -c '.lastStatus = "generating"' "$STATE_FILE" >"$STATE_FILE.tmp" && mv "$STATE_FILE.tmp" "$STATE_FILE"
+  read_state | jq -c '.lastStatus = "generating"' | write_atomic "$STATE_FILE"
 
   local body="" used_fallback=false
   if ((count == 0)); then
@@ -581,7 +663,7 @@ cmd_generate() {
   local ts entry
   ts=$(date +%s)
   entry="$ENTRIES_DIR/$ts.md"
-  printf '%s\n' "$body" >"$entry"
+  printf '%s\n' "$body" | write_atomic "$entry"
 
   local since until
   since=$(jq -r '.since' <<<"$digest")
@@ -595,7 +677,7 @@ cmd_generate() {
                    commits:$commits, repos:$repos, fallback:$fallback, manual:$manual,
                    widened:$widened}]
                  + [.entries[] | select((.manual and $manual and .date == $date) | not)])[:60]' \
-    "$INDEX_FILE" >"$INDEX_FILE.tmp" && mv "$INDEX_FILE.tmp" "$INDEX_FILE"
+    <<<"$(read_index)" | write_atomic "$INDEX_FILE"
 
   prune_entries
   finish_state "ok"
@@ -609,12 +691,12 @@ finish_state() {
   local until=${UNTIL_ISO:-$(date -Is)}
   jq -c --arg status "$status" --arg until "$until" --argjson ts "$(date +%s)" \
     '.running = false | .lastStatus = $status | .lastRunTs = $ts | .lastRunUntil = $until' \
-    "$STATE_FILE" >"$STATE_FILE.tmp" && mv "$STATE_FILE.tmp" "$STATE_FILE"
+    <<<"$(read_state)" | write_atomic "$STATE_FILE"
 }
 
 prune_entries() {
   local keep f
-  keep=$(jq -r '.entries[].id' "$INDEX_FILE" 2>/dev/null | tr '\n' ' ')
+  keep=$(read_index | jq -r '.entries[].id' 2>/dev/null | tr '\n' ' ')
   for f in "$ENTRIES_DIR"/*.md; do
     [[ -e $f ]] || continue
     local id
@@ -629,17 +711,17 @@ cmd_list() {
   ensure_dirs
   jq -c '{ok:true, lastSeenTs:(.lastSeenTs // 0),
           unread:([.entries[] | select(.ts > (.lastSeenTs // 0))] | length),
-          entries:.entries}' "$INDEX_FILE" 2>/dev/null ||
+          entries:.entries}' <<<"$(read_index)" 2>/dev/null ||
     printf '%s\n' '{"ok":true,"lastSeenTs":0,"unread":0,"entries":[]}'
 }
 
 cmd_status() {
   ensure_dirs
   local seen
-  seen=$(jq -r '.lastSeenTs // 0' "$INDEX_FILE")
+  seen=$(read_index | jq -r '.lastSeenTs // 0')
   jq -nc \
-    --argjson idx "$(cat "$INDEX_FILE")" \
-    --argjson st "$(cat "$STATE_FILE")" \
+    --argjson idx "$(read_index)" \
+    --argjson st "$(read_state)" \
     --argjson seen "$seen" \
     '{ok:true, running:($st.running // false), lastStatus:($st.lastStatus // ""),
       lastRunTs:($st.lastRunTs // 0), lastSeenTs:$seen,
@@ -654,7 +736,7 @@ valid_id() { [[ $1 =~ ^[0-9]+$ ]]; }
 cmd_show() {
   ensure_dirs
   local id=${1:-}
-  [[ -n $id ]] || id=$(jq -r '.entries[0].id // ""' "$INDEX_FILE")
+  [[ -n $id ]] || id=$(read_index | jq -r '.entries[0].id // ""')
   if [[ -n $id ]] && ! valid_id "$id"; then
     jq -nc '{ok:false, error:"invalid id"}'
     return 1
@@ -663,16 +745,18 @@ cmd_show() {
     jq -nc '{ok:true, id:"", body:""}'
     return 0
   }
-  jq -nc --arg id "$id" --rawfile body "$ENTRIES_DIR/$id.md" '{ok:true, id:$id, body:$body}'
+  local body
+  body=$(read_bounded "$ENTRIES_DIR/$id.md" "$MAX_ENTRY_BYTES") || body=""
+  jq -nc --arg id "$id" --arg body "$body" '{ok:true, id:$id, body:$body}'
 }
 
 cmd_seen() {
   ensure_dirs
   local ts=${1:-}
-  [[ -n $ts ]] || ts=$(jq -r '.entries[0].ts // 0' "$INDEX_FILE")
+  [[ -n $ts ]] || ts=$(read_index | jq -r '.entries[0].ts // 0')
   valid_id "${ts:-0}" || die "invalid timestamp"
   jq -c --argjson ts "${ts:-0}" '.lastSeenTs = (if $ts > (.lastSeenTs // 0) then $ts else .lastSeenTs end)' \
-    "$INDEX_FILE" >"$INDEX_FILE.tmp" && mv "$INDEX_FILE.tmp" "$INDEX_FILE"
+    <<<"$(read_index)" | write_atomic "$INDEX_FILE"
   cmd_status
 }
 
@@ -680,8 +764,7 @@ cmd_delete() {
   ensure_dirs
   local id=${1:?id required}
   valid_id "$id" || die "invalid id"
-  jq -c --arg id "$id" '.entries = [.entries[] | select(.id != $id)]' "$INDEX_FILE" >"$INDEX_FILE.tmp" &&
-    mv "$INDEX_FILE.tmp" "$INDEX_FILE"
+  read_index | jq -c --arg id "$id" '.entries = [.entries[] | select(.id != $id)]' | write_atomic "$INDEX_FILE"
   rm -f "$ENTRIES_DIR/$id.md"
   cmd_list
 }
