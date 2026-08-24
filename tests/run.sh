@@ -402,6 +402,37 @@ else
   no "no predictable temp files are left behind"
 fi
 
+# The read is bound to one descriptor: the open itself refuses a symlinked final
+# component and cannot block, so there is no window between checking a pathname
+# and opening it.
+rm -f "$STATE_DIR/index.json"
+mkfifo "$STATE_DIR/index.json"
+START=$(date +%s)
+timeout 10 "$ENGINE" status >/dev/null 2>&1
+RC=$?
+ELAPSED=$(( $(date +%s) - START ))
+if ((RC != 124)) && ((ELAPSED < 5)); then ok "a fifo swapped in cannot block the open"; else no "a fifo swapped in cannot block the open" "rc=$RC elapsed=${ELAPSED}s"; fi
+rm -f "$STATE_DIR/index.json"
+
+# A symlink whose target is a fifo is the same attack wearing a hat.
+mkfifo "$WORK/trap.fifo"
+ln -sf "$WORK/trap.fifo" "$STATE_DIR/index.json"
+START=$(date +%s)
+timeout 10 "$ENGINE" status >/dev/null 2>&1
+RC=$?
+ELAPSED=$(( $(date +%s) - START ))
+if ((RC != 124)) && ((ELAPSED < 5)); then ok "a symlink to a fifo cannot block the open either"; else no "a symlink to a fifo cannot block the open either" "rc=$RC elapsed=${ELAPSED}s"; fi
+rm -f "$STATE_DIR/index.json" "$WORK/trap.fifo"
+
+# O_NOFOLLOW: the final component must be a real file, so a swapped symlink is
+# not silently accepted just because its target happens to be same-owner.
+printf '%s' '{"entries":[{"id":"9","ts":9,"date":"2026-01-01"}],"lastSeenTs":0}' >"$WORK/decoy.json"
+ln -sf "$WORK/decoy.json" "$STATE_DIR/index.json"
+check "a symlinked state file is refused, not followed" "0" "$("$ENGINE" list | jq -r '.entries | length')"
+rm -f "$STATE_DIR/index.json"
+cp "$WORK/index.good.json" "$STATE_DIR/index.json"
+check "and the real file still reads afterwards" "true" "$("$ENGINE" list | jq -r '.ok')"
+
 echo
 echo "== Model.js =="
 JSRUN=""

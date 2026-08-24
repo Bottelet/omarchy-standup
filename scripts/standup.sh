@@ -44,46 +44,52 @@ die() {
   exit 1
 }
 
-# Reads a file through a single descriptor with a hard ceiling.
+# Reads a file through exactly one descriptor, with a hard ceiling.
 #
-# Type and owner are checked on the open descriptor rather than re-checked by
-# pathname, so replacing the file between the check and the read cannot change
-# what was validated. The type is also checked before the open, because opening
-# a fifo blocks until a writer appears and would hang the caller before any
-# descriptor check could run.
+# The open uses O_NOFOLLOW so a symlink at the final component is refused
+# outright, and O_NONBLOCK so a fifo cannot make the open hang. Type, owner and
+# size are then read with fstat on that same descriptor, and the bytes come
+# from that descriptor too. Nothing is ever looked up by pathname twice, so
+# there is no window between checking and using: whatever was validated is
+# exactly what is read.
+#
+# A symlinked config directory still works, since O_NOFOLLOW only governs the
+# final component.
+BOUNDED_READ_PY='
+import os, stat, sys
+path, cap, label = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+
+def refuse(reason):
+    sys.stderr.write("%s refused: %s\n" % (label, reason))
+    raise SystemExit(1)
+
+try:
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+except OSError as e:
+    refuse("cannot open (%s)" % e.strerror)
+try:
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode):
+        refuse("not a regular file")
+    if st.st_uid != os.getuid():
+        refuse("not owned by this user")
+    if st.st_size > cap:
+        refuse("larger than %d bytes" % cap)
+    data = b""
+    while len(data) <= cap:
+        chunk = os.read(fd, 65536)
+        if not chunk:
+            break
+        data += chunk
+    if len(data) > cap:
+        refuse("larger than %d bytes" % cap)
+finally:
+    os.close(fd)
+sys.stdout.buffer.write(data)
+'
+
 read_bounded() { # read_bounded <path> <max-bytes>
-  local path=$1 max=$2 fd info kind owner content bytes
-  [[ -e $path ]] || return 1
-  if [[ $(stat -c '%u' "$path" 2>/dev/null) != "$UID" ]]; then
-    log "refused, not owned by this user: $path"
-    return 1
-  fi
-  if [[ ! -f $path ]]; then
-    log "refused, not a regular file: $path"
-    return 1
-  fi
-  # Braces matter: a bare `exec ... 2>/dev/null` would point this shell's
-  # stderr at /dev/null for good.
-  if ! { exec {fd}<"$path"; } 2>/dev/null; then
-    log "refused, cannot open: $path"
-    return 1
-  fi
-  info=$(stat -L -c '%F|%u' "/proc/self/fd/$fd" 2>/dev/null)
-  kind=${info%%|*}
-  owner=${info##*|}
-  if [[ $kind != "regular file" || $owner != "$UID" ]]; then
-    exec {fd}<&-
-    log "refused, descriptor is not a regular file owned by this user: $path"
-    return 1
-  fi
-  content=$(head -c $((max + 1)) <&"$fd")
-  exec {fd}<&-
-  bytes=$(printf '%s' "$content" | wc -c)
-  if ((bytes > max)); then
-    log "refused, larger than $max bytes: $path"
-    return 1
-  fi
-  printf '%s' "$content"
+  python3 -c "$BOUNDED_READ_PY" "$1" "$2" "$(basename "$1")" 2>>"$LOG_FILE"
 }
 
 # Replaces a file atomically without ever writing through a planted symlink.
