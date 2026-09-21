@@ -600,6 +600,16 @@ cmd_generate() {
     die "a standup is already being generated"
   fi
 
+  # Whatever ends this run early - a die, a signal, a shell that tears the
+  # process down - must not leave "running" set, or the panel wedges on a
+  # spinner and never starts another run. Only a signal that kills the
+  # process outright escapes this; reconcile_running covers that case.
+  GENERATE_FINISHED=false
+  trap '[[ $GENERATE_FINISHED == true ]] || mark_interrupted' EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+
   read_state | jq -c '.running = true | .lastStatus = "collecting"' | write_atomic "$STATE_FILE"
 
   local digest
@@ -694,10 +704,31 @@ cmd_generate() {
 
 finish_state() {
   local status=$1
+  GENERATE_FINISHED=true
   local until=${UNTIL_ISO:-$(date -Is)}
   jq -c --arg status "$status" --arg until "$until" --argjson ts "$(date +%s)" \
     '.running = false | .lastStatus = $status | .lastRunTs = $ts | .lastRunUntil = $until' \
     <<<"$(read_state)" | write_atomic "$STATE_FILE"
+}
+
+# A generate run holds LOCK_FILE for its whole life, and the kernel drops that
+# lock the instant the process dies, however it dies. The "running" flag in
+# the state file, by contrast, is only cleared by a run that reaches
+# finish_state. A run killed part-way (shell restart, panel unload, SIGKILL)
+# therefore leaves the flag set forever, the panel shows a spinner forever,
+# and it refuses to start another run because it believes one is in
+# progress. The lock is the truth; the flag is only a cache of it.
+mark_interrupted() {
+  jq -c '.running = false | .lastStatus = "interrupted"' <<<"$(read_state)" | write_atomic "$STATE_FILE"
+}
+
+reconcile_running() {
+  [[ $(read_state | jq -r '.running // false' 2>/dev/null) == true ]] || return 0
+  # flock -n on the path succeeds only when nobody holds the lock.
+  if flock -n "$LOCK_FILE" true 2>/dev/null; then
+    log "clearing stale running flag: no generate process holds the lock"
+    mark_interrupted
+  fi
 }
 
 prune_entries() {
@@ -723,6 +754,7 @@ cmd_list() {
 
 cmd_status() {
   ensure_dirs
+  reconcile_running
   local seen
   seen=$(read_index | jq -r '.lastSeenTs // 0')
   jq -nc \
