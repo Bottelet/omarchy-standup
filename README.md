@@ -1,7 +1,8 @@
 # Omarchy Standup
 
-A short daily standup, written for you from the git activity across all your
-project folders, on a schedule you set.
+A short daily standup, written for you from the git activity across your
+project folders, any repos you name, and whole GitHub organizations, on a
+schedule you set.
 
 ![Standup panel](preview.png)
 
@@ -14,6 +15,16 @@ bullets, copy them into Slack, get on with your day.
   both — sub-folders are scanned too, so one entry covers a whole tree of repos.
   Linked git worktrees are recognised, so twenty `myapp-wt-*` folders count as
   one project rather than twenty.
+- **Name individual repos.** A repo that lives outside your project folders can
+  be added once, by path — or as `owner/name` for one that is on GitHub but not
+  cloned here at all. A path must be anchored (`/…`, `~/…`, `./…`); anything
+  else is read as a GitHub repo, so the same entry always means the same thing
+  no matter where the script runs from.
+- **Cover a whole GitHub organization.** Name the org and every repo in it you
+  committed to shows up, cloned or not. Nothing is cloned and nothing is
+  written: the commits come from the GitHub API through your existing `gh`
+  login. A repo you *do* have cloned is read from the clone and reported once,
+  not twice.
 - **Picks up where the last standup stopped.** Monday's standup covers Friday
   automatically. A fixed "last N days" window is there if you prefer it.
 - **Filter by author.** Only your commits by default — across every git identity
@@ -65,6 +76,10 @@ The engine is a plain script, so you can use it on its own:
 ```bash
 ~/.config/omarchy/plugins/bottelet.standup/scripts/standup.sh \
   generate --roots "~/Projects,~/Work" --window fixed --days 3
+
+# A repo outside your folders, and every repo in an org
+~/.config/omarchy/plugins/bottelet.standup/scripts/standup.sh \
+  generate --repos "~/code/thing, acme-inc/private-api" --orgs "acme-inc"
 ```
 
 ## Settings
@@ -73,8 +88,10 @@ All settings live in the panel's gear page.
 
 | Setting | Default | What it does |
 | --- | --- | --- |
-| Project folders | `~/Projects` | Comma-separated roots to scan |
+| Folders to scan | `~/Projects` | Comma-separated roots to scan |
 | Folder depth | `2` | How deep to look for repos under each root |
+| Individual repos | empty | Repos to include wherever they live: an anchored path on this machine (`~/code/thing`), or a GitHub repo as `owner/name` or a clone URL |
+| GitHub organizations | empty | Comma-separated org names. Every repo in the org you committed to, cloned or not — needs `gh` logged in |
 | Time range | Since the last standup | Or a fixed number of days |
 | Days back | `1` | Used when the range is fixed |
 | Whose commits | Only me | Everyone, or a hand-picked set of authors |
@@ -84,6 +101,32 @@ All settings live in the panel's gear page.
 | Generate automatically | on | Off means manual only |
 | At | `09:00` | Time of day to generate |
 | Weekdays | Mon–Fri | Which days to generate on |
+
+## GitHub organizations
+
+Org and non-cloned repo activity is read through the [`gh`](https://cli.github.com)
+CLI, using the login you already have — the plugin stores no token of its own
+and asks for no scope beyond what `gh auth login` gave it. Check it is ready
+with `gh auth status`; `repo` scope covers private repos and `read:org` covers
+org membership.
+
+This is the one part of the plugin that touches the network. If `gh` is missing,
+logged out or rate-limited, the run still produces a standup from your local
+repos and says so on the settings page rather than failing.
+
+Only commits matching your author filter are fetched, within the same time
+window as the local scan. A repo you have cloned is read from the clone and
+reported once, not twice.
+
+The repo count on the settings page is a reachability check — how many repos
+are *visible* in the configured scope — which is deliberately a larger number
+than the standup itself covers. The standup only ever reports repos you
+committed to in the window.
+
+If you pick specific people under **Whose commits**, note that they are matched
+on GitHub by login or email. A free-text name like `Jane Doe` cannot be searched
+for, so org and remote repos are skipped for that run and the panel says so —
+rather than quietly substituting your own commits.
 
 ## Dependencies
 

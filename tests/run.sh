@@ -434,6 +434,172 @@ cp "$WORK/index.good.json" "$STATE_DIR/index.json"
 check "and the real file still reads afterwards" "true" "$("$ENGINE" list | jq -r '.ok')"
 
 echo
+echo "== explicit repos and orgs =="
+
+# A stub `gh`. The engine projects search results to six fields with --jq at the
+# call site, so the stub prints that projection directly, one JSON object per
+# line, and honours per_page/page so pagination can be exercised.
+STUB_GH_DIR="$WORK/ghstub"
+mkdir -p "$STUB_GH_DIR"
+: >"$STUB_GH_DIR/commits.jsonl"
+: >"$STUB_GH_DIR/repos.txt"
+echo "meuser" >"$STUB_GH_DIR/login"
+: >"$STUB_GH_DIR/calls.log"
+
+cat >"$WORK/gh" <<'GHEOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$STUB_GH_DIR/calls.log"
+case "$1" in
+auth) [[ -f $STUB_GH_DIR/unauthed ]] && exit 1; exit 0 ;;
+api)
+  for a in "$@"; do [[ $a == user ]] && { cat "$STUB_GH_DIR/login"; exit 0; }; done
+  per=100; page=1
+  for a in "$@"; do
+    [[ $a == per_page=* ]] && per=${a#per_page=}
+    [[ $a == page=* ]] && page=${a#page=}
+  done
+  start=$(((page - 1) * per + 1))
+  sed -n "${start},$((start + per - 1))p" "$STUB_GH_DIR/commits.jsonl"
+  ;;
+repo) cat "$STUB_GH_DIR/repos.txt" ;;
+esac
+exit 0
+GHEOF
+chmod +x "$WORK/gh"
+export STUB_GH_DIR
+export OMARCHY_STANDUP_GH_BIN="$WORK/gh"
+
+emit_commit() { # emit_commit <sha> <repo> <subject> [email]
+  python3 -c '
+import json, sys
+print(json.dumps({"sha": sys.argv[1], "repo": sys.argv[2], "an": "Remote Person",
+                  "ae": sys.argv[4], "d": "2026-01-02T03:04:05.000+00:00",
+                  "s": sys.argv[3]}))' "$1" "$2" "$3" "${4:-them@example.com}" \
+    >>"$STUB_GH_DIR/commits.jsonl"
+}
+
+# ---- repo entry shapes all reduce to owner/name
+: >"$STUB_GH_DIR/commits.jsonl"
+emit_commit deadbeefdeadbeefdeadbeefdeadbeefdeadbeef "acme/api" "Remote work"
+for spelling in "acme/api" "https://github.com/acme/api" "https://github.com/acme/api.git" \
+  "git@github.com:acme/api.git" "ssh://git@github.com/acme/api" "github.com/acme/api"; do
+  outj=$(bash "$ENGINE" collect --roots "" --repos "$spelling" --window fixed --days 5)
+  check "repo entry '$spelling' resolves to acme/api" "acme/api" "$(jq -r '.repos[0].path // ""' <<<"$outj")"
+done
+
+# ---- a clone URL carrying a credential must not reach the log
+: >"$OMARCHY_STANDUP_STATE/standup.log"
+bash "$ENGINE" collect --roots "" \
+  --repos "https://user:ghp_SUPERSECRET@github.com/acme/api" --window fixed --days 5 >/dev/null
+logtext=$(cat "$OMARCHY_STANDUP_STATE/standup.log" 2>/dev/null)
+if [[ $logtext == *ghp_SUPERSECRET* ]]; then
+  no "a credential in a repo entry never reaches the log"
+else
+  ok "a credential in a repo entry never reaches the log"
+fi
+
+# ---- path vs slug is decided by shape, not by the current directory
+: >"$STUB_GH_DIR/calls.log"
+outj=$(cd "$WORK" && bash "$ENGINE" collect --roots "" --repos "./nope" --window fixed --days 5)
+check "an anchored path that is missing is not a source at all" "false" "$(jq -r '.ok' <<<"$outj")"
+if grep -q 'search/commits' "$STUB_GH_DIR/calls.log"; then
+  no "an anchored path that is missing never becomes a network lookup"
+else
+  ok "an anchored path that is missing never becomes a network lookup"
+fi
+outj=$(bash "$ENGINE" collect --roots "" --repos "$ROOTS/alpha" --window fixed --days 400)
+check "an absolute path is collected locally" "local" "$(jq -r '.repos[0].source // ""' <<<"$outj")"
+
+# ---- org names are validated, and a bad one is not passed to gh
+for bad in "-flag" "bad org" "../etc" "a/b"; do
+  outj=$(bash "$ENGINE" collect --roots "" --orgs "$bad" --window fixed --days 5)
+  check "org '$bad' is refused" "false" "$(jq -r '.ok' <<<"$outj")"
+done
+outj=$(bash "$ENGINE" collect --roots "" --orgs "acme-inc" --window fixed --days 5)
+check "a well-formed org is accepted" "true" "$(jq -r '.ok' <<<"$outj")"
+
+# ---- org collection produces repo entries in the local shape
+: >"$STUB_GH_DIR/commits.jsonl"
+emit_commit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa "acme/api" "Ship the API"
+emit_commit bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb "acme/web" "Ship the web app"
+outj=$(bash "$ENGINE" collect --roots "" --orgs acme --window fixed --days 5)
+check "org repos are collected" "2" "$(jq -r '.repoCount' <<<"$outj")"
+check "org commits are counted" "2" "$(jq -r '.commitCount' <<<"$outj")"
+check "an org entry is marked github" "github" "$(jq -r '.repos[0].source' <<<"$outj")"
+check "an org entry carries no branch" "" "$(jq -r '.repos[0].branch' <<<"$outj")"
+contains "the org reaches the query" "org:acme" "$(cat "$STUB_GH_DIR/calls.log")"
+
+# ---- a commit already found in a clone is not reported twice
+DEDUPE="$WORK/dedupe"
+mkrepo "$DEDUPE/api"
+commit "$DEDUPE/api" "Local and remote"
+git -C "$DEDUPE/api" remote add origin "git@github.com:acme/api.git"
+localsha=$(git -C "$DEDUPE/api" rev-parse HEAD)
+: >"$STUB_GH_DIR/commits.jsonl"
+emit_commit "$localsha" "acme/api" "Local and remote" "me@example.com"
+emit_commit cccccccccccccccccccccccccccccccccccccccc "acme/api" "Only on the remote" "me@example.com"
+outj=$(bash "$ENGINE" collect --roots "$DEDUPE" --orgs acme --window fixed --days 400)
+check "a clone and its org twin are one project" "1" "$(jq -r '.repoCount' <<<"$outj")"
+check "the shared commit is counted once" "2" "$(jq -r '.commitCount' <<<"$outj")"
+check "every sha in the digest is unique" "true" \
+  "$(jq -r '([.repos[].commits[].h]|length) == ([.repos[].commits[].h]|unique|length)' <<<"$outj")"
+check "the merged entry says it used both" "local+github" "$(jq -r '.repos[0].source' <<<"$outj")"
+check "the merged entry keeps the local path" "$DEDUPE/api" "$(jq -r '.repos[0].path' <<<"$outj")"
+
+# ---- the whole-digest commit cap survives the merge
+: >"$STUB_GH_DIR/commits.jsonl"
+for r in 1 2 3 4 5 6 7 8 9 10; do
+  for c in $(seq 1 40); do
+    emit_commit "$(printf '%040d' $((r * 1000 + c)))" "acme/r$r" "Commit $c"
+  done
+done
+outj=$(bash "$ENGINE" collect --roots "" --orgs acme --author-mode all --window fixed --days 5)
+total=$(jq -r '.commitCount' <<<"$outj")
+if ((total <= 300)); then ok "the merged digest respects MAX_COMMITS_TOTAL (got $total)"
+else no "the merged digest respects MAX_COMMITS_TOTAL" "got $total, cap is 300"; fi
+check "hitting the cap is reported" "true" "$(jq -r '.truncated' <<<"$outj")"
+
+# ---- pagination stops at the page cap
+: >"$STUB_GH_DIR/calls.log"
+bash "$ENGINE" collect --roots "" --orgs acme --author-mode all --window fixed --days 5 >/dev/null
+check "no more than MAX_REMOTE_PAGES pages are requested" "3" \
+  "$(grep -c 'search/commits' "$STUB_GH_DIR/calls.log")"
+
+# ---- a custom author list is never answered with your own commits
+: >"$STUB_GH_DIR/commits.jsonl"
+emit_commit dddddddddddddddddddddddddddddddddddddddd "acme/api" "Should not appear"
+: >"$STUB_GH_DIR/calls.log"
+outj=$(bash "$ENGINE" collect --roots "" --orgs acme --author-mode custom \
+  --authors "Jane Doe" --window fixed --days 5)
+check "an unsearchable custom author collects nothing remotely" "0" "$(jq -r '.commitCount' <<<"$outj")"
+contains "and says why" "none of the selected authors" "$(jq -r '.warnings[0] // ""' <<<"$outj")"
+if grep -q 'author:meuser' "$STUB_GH_DIR/calls.log"; then
+  no "a custom author list never falls back to the current user"
+else
+  ok "a custom author list never falls back to the current user"
+fi
+outj=$(bash "$ENGINE" collect --roots "" --orgs acme --author-mode custom \
+  --authors "jane@example.com" --window fixed --days 5)
+contains "a searchable custom author is queried by email" "author-email:jane@example.com" \
+  "$(cat "$STUB_GH_DIR/calls.log")"
+
+# ---- gh unavailable degrades instead of failing
+touch "$STUB_GH_DIR/unauthed"
+outj=$(bash "$ENGINE" collect --roots "$ROOTS" --orgs acme --window fixed --days 400)
+check "a logged-out gh still produces a digest" "true" "$(jq -r '.ok' <<<"$outj")"
+contains "and warns" "GitHub not reachable" "$(jq -r '.warnings[0] // ""' <<<"$outj")"
+localonly=$(jq -r '[.repos[] | select(.source == "local")] | length' <<<"$outj")
+if ((localonly > 0)); then ok "local repos still collected when gh is down"
+else no "local repos still collected when gh is down"; fi
+rm -f "$STUB_GH_DIR/unauthed"
+
+# ---- nothing configured at all is an error, and still valid JSON
+outj=$(bash "$ENGINE" collect --roots "" --window fixed --days 5)
+check "no sources is an error" "false" "$(jq -r '.ok' <<<"$outj")"
+check "the error is still JSON" "0" "$(jq -e . >/dev/null 2>&1 <<<"$outj"; echo $?)"
+
+unset OMARCHY_STANDUP_GH_BIN
+
 echo "== Model.js =="
 JSRUN=""
 command -v node >/dev/null 2>&1 && JSRUN=node
@@ -445,7 +611,7 @@ else
 var fs = require("fs")
 var src = fs.readFileSync(process.argv[2], "utf8").replace(".pragma library", "")
 var M = {}
-new Function("exports", src + "\n;Object.assign(exports, {DEFAULTS:DEFAULTS, WEEKDAYS:WEEKDAYS, settingsWithDefaults:settingsWithDefaults, generateArgs:generateArgs, authorMode:authorMode, authorValues:authorValues, scheduleDays:scheduleDays, parseTimeOfDay:parseTimeOfDay, formatTimeOfDay:formatTimeOfDay, scheduleDue:scheduleDue, bulletsOf:bulletsOf, displayLines:displayLines, stripMarkdown:stripMarkdown, relativeDay:relativeDay, unreadCount:unreadCount, sourceLine:sourceLine, agentOptions:agentOptions, formatOptions:formatOptions, formatPreset:formatPreset, formatText:formatText, formatSummary:formatSummary, parseJson:parseJson, toBool:toBool, clampInt:clampInt})")(M)
+new Function("exports", src + "\n;Object.assign(exports, {DEFAULTS:DEFAULTS, WEEKDAYS:WEEKDAYS, settingsWithDefaults:settingsWithDefaults, generateArgs:generateArgs, authorMode:authorMode, authorValues:authorValues, scheduleDays:scheduleDays, parseTimeOfDay:parseTimeOfDay, formatTimeOfDay:formatTimeOfDay, scheduleDue:scheduleDue, bulletsOf:bulletsOf, displayLines:displayLines, stripMarkdown:stripMarkdown, relativeDay:relativeDay, unreadCount:unreadCount, sourceLine:sourceLine, agentOptions:agentOptions, formatOptions:formatOptions, formatPreset:formatPreset, formatText:formatText, formatSummary:formatSummary, sourceSummary:sourceSummary, repoValues:repoValues, orgValues:orgValues, listValues:listValues, reposArgs:reposArgs, authorsOptionsArgs:authorsOptionsArgs, parseJson:parseJson, toBool:toBool, clampInt:clampInt})")(M)
 
 var pass = 0, fail = 0
 function eq(name, expected, actual) {
@@ -456,10 +622,41 @@ function eq(name, expected, actual) {
 
 eq("defaults fill in", "~/Projects", M.settingsWithDefaults({}).roots)
 eq("a set value wins", "~/Work", M.settingsWithDefaults({roots: "~/Work"}).roots)
-eq("an empty string does not override", "~/Projects", M.settingsWithDefaults({roots: ""}).roots)
+eq("an empty string does not override", "default", M.settingsWithDefaults({agent: ""}).agent)
+// Folders are no longer the only source, so clearing them is a real choice:
+// someone pulling only from named repos or an org must not get ~/Projects back.
+eq("cleared folders stay cleared", "", M.settingsWithDefaults({roots: ""}).roots)
 eq("string false is false", false, M.settingsWithDefaults({autoGenerate: "false"}).autoGenerate)
 eq("days are clamped", 30, M.settingsWithDefaults({days: 900}).days)
 eq("junk days fall back", 1, M.settingsWithDefaults({days: "banana"}).days)
+
+// ---- repos and orgs
+eq("repos default to none", "", M.settingsWithDefaults({}).repos)
+eq("orgs default to none", "", M.settingsWithDefaults({}).orgs)
+eq("a list splits on commas", ["a", "b"], M.listValues("a, b"))
+eq("a list splits on newlines too", ["a", "b"], M.listValues("a\nb"))
+eq("a list drops blanks", ["a"], M.listValues(" , a ,, "))
+eq("a colon survives in a repo entry", ["git@github.com:o/r.git"],
+   M.repoValues({repos: " git@github.com:o/r.git "}))
+eq("org names keep their shape", ["acme", "acme-inc"], M.orgValues({orgs: "acme, @acme-inc"}))
+eq("an unusable org name is dropped", [], M.orgValues({orgs: "not an org!"}))
+
+var srcArgs = M.generateArgs({roots: "~/a", repos: "o/r", orgs: "acme"}, false)
+eq("repos reach the engine", "o/r", srcArgs[srcArgs.indexOf("--repos") + 1])
+eq("orgs reach the engine", "acme", srcArgs[srcArgs.indexOf("--orgs") + 1])
+var emptySrc = M.generateArgs({}, false)
+eq("repos are always passed, even empty", "", emptySrc[emptySrc.indexOf("--repos") + 1])
+eq("orgs are always passed, even empty", "", emptySrc[emptySrc.indexOf("--orgs") + 1])
+eq("the repo count command carries all three sources",
+   ["repos", "~/a", "2", "o/r", "acme"], M.reposArgs({roots: "~/a", repos: "o/r", orgs: "acme"}))
+eq("the author picker sees explicit repos but not orgs",
+   ["authors", "~/a", "2", "30", "options", "o/r"],
+   M.authorsOptionsArgs({roots: "~/a", repos: "o/r", orgs: "acme"}))
+
+eq("one source reads as one source", "1 folder", M.sourceSummary({roots: "~/a", repos: "", orgs: ""}))
+eq("sources add up", "2 folders + 1 repo + 1 org",
+   M.sourceSummary({roots: "~/a, ~/b", repos: "o/r", orgs: "acme"}))
+eq("no sources say so", "Nothing selected", M.sourceSummary({roots: "", repos: "", orgs: ""}))
 
 eq("me is the default author mode", "me", M.authorMode({}))
 eq("custom with nobody picked degrades to me", "me", M.authorMode({authorMode: "custom", authors: ""}))

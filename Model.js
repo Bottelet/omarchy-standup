@@ -4,6 +4,8 @@
 
 var DEFAULTS = {
   roots: "~/Projects",
+  repos: "",
+  orgs: "",
   scanDepth: 2,
   windowMode: "auto",
   days: 1,
@@ -104,7 +106,12 @@ function settingsWithDefaults(settings) {
   // default should win. scheduleDays is the exception: clearing every weekday
   // is a deliberate "never run automatically", and falling back to the default
   // would quietly switch the schedule back on.
-  var emptyIsMeaningful = { scheduleDays: true }
+  // scheduleDays: clearing every weekday is a deliberate "never run
+  // automatically", and the default would quietly switch the schedule back on.
+  // roots: with repos and orgs as alternative sources, an empty folder list is
+  // a real choice - someone working only from named repos or a GitHub org
+  // should not have ~/Projects put back underneath them.
+  var emptyIsMeaningful = { scheduleDays: true, roots: true, repos: true, orgs: true }
   if (settings) {
     for (var s in settings) {
       if (settings[s] === undefined || settings[s] === null) continue
@@ -147,6 +154,8 @@ function generateArgs(settings, force) {
   var s = settingsWithDefaults(settings)
   var args = ["generate",
               "--roots", String(s.roots),
+              "--repos", String(s.repos),
+              "--orgs", String(s.orgs),
               "--depth", String(s.scanDepth),
               "--window", s.windowMode === "fixed" ? "fixed" : "auto",
               "--days", String(s.days),
@@ -184,12 +193,58 @@ function authorValues(settings) {
 
 function authorsOptionsArgs(settings) {
   var s = settingsWithDefaults(settings)
-  return ["authors", String(s.roots), String(s.scanDepth), "30", "options"]
+  // Orgs are left out on purpose: the picker lists people from local history,
+  // and enumerating an org's authors would be a request per repo.
+  return ["authors", String(s.roots), String(s.scanDepth), "30", "options", String(s.repos)]
 }
 
 function reposArgs(settings) {
   var s = settingsWithDefaults(settings)
-  return ["repos", String(s.roots), String(s.scanDepth)]
+  return ["repos", String(s.roots), String(s.scanDepth), String(s.repos), String(s.orgs)]
+}
+
+// Comma- and newline-separated entries, whitespace-trimmed. The engine splits
+// the same way; this side only needs it for the counts shown in settings.
+function listValues(raw) {
+  if (raw instanceof Array) raw = raw.join(",")
+  return String(raw || "").split(/[,\n]/)
+    .map(function(v) { return v.trim() })
+    .filter(function(v) { return v !== "" })
+}
+
+// Roots additionally split on ":", matching split_roots in the engine. Repos
+// and orgs must not: ":" is the separator in git@github.com:owner/repo.git.
+function rootValues(settings) {
+  var raw = settingsWithDefaults(settings).roots
+  if (raw instanceof Array) raw = raw.join(",")
+  return String(raw || "").split(/[,\n:]/)
+    .map(function(v) { return v.trim() })
+    .filter(function(v) { return v !== "" })
+}
+
+function repoValues(settings) {
+  return listValues(settingsWithDefaults(settings).repos)
+}
+
+function orgValues(settings) {
+  // A leading @ is a natural way to write an org name and harmless to accept.
+  return listValues(settingsWithDefaults(settings).orgs)
+    .map(function(v) { return v.replace(/^@/, "") })
+    .filter(function(v) { return /^[A-Za-z0-9][A-Za-z0-9-]*$/.test(v) })
+}
+
+// What the PROJECTS section says it is pulling from, in one line.
+function sourceSummary(settings) {
+  var s = settingsWithDefaults(settings)
+  var parts = []
+  var folders = rootValues(s).length
+  if (folders > 0) parts.push(folders + " folder" + (folders === 1 ? "" : "s"))
+  var repos = repoValues(s).length
+  if (repos > 0) parts.push(repos + " repo" + (repos === 1 ? "" : "s"))
+  var orgs = orgValues(s).length
+  if (orgs > 0) parts.push(orgs + " org" + (orgs === 1 ? "" : "s"))
+  if (parts.length === 0) return "Nothing selected"
+  return parts.join(" + ")
 }
 
 // ------------------------------------------------------------------ schedule
@@ -333,6 +388,11 @@ function sourceLine(entry) {
   bits.push(repos + " project" + (repos === 1 ? "" : "s"))
   if (entry.fallback) bits.push("no agent - raw summary")
   else if (entry.agent) bits.push("via " + entry.agent)
+  // A run that could not reach GitHub produced a standup covering less than
+  // was asked for. That belongs next to the counts, not only in settings.
+  if (entry.warnings instanceof Array && entry.warnings.length > 0) {
+    bits.push(String(entry.warnings[0]))
+  }
   return bits.join("  ·  ")
 }
 

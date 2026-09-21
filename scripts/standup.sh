@@ -35,6 +35,31 @@ MAX_SCAN_BYTES=4000000
 MAX_INDEX_BYTES=1048576
 MAX_STATE_BYTES=65536
 MAX_ENTRY_BYTES=262144
+# Remote collection. The search API caps a query at 1000 results and 100 per
+# page; three pages is already far more commits than a standup can use, and it
+# bounds a whole-org run that names no author.
+MAX_REMOTE_PAGES=3
+MAX_REMOTE_PER_PAGE=100
+MAX_REMOTE_BYTES=2000000
+# Per-call ceilings bound one request; these bound the whole run. A custom
+# author list is a fan-out multiplier - one paginated search per author - so
+# without a cap on the number of queries and on the bytes kept across them,
+# "3 pages, 2 MB, 60s" is a per-call fact that says nothing about the total.
+# One query per author is not a design choice but a constraint: GitHub honours
+# only the first author-email: in a query and ignores the rest, so a team
+# cannot be batched into one search. A hand-picked team of a dozen is ordinary,
+# so the cap is set well above that and the wall-clock budget below is what
+# actually bounds the work.
+MAX_AUTHOR_QUERIES=20
+# A ceiling on remote work for the whole process, not per call. Fan-out times
+# pagination times GH_TIMEOUT is measured in tens of minutes, and the panel sits
+# on `busy` with no timeout of its own for every second of it.
+REMOTE_BUDGET_SECONDS="${OMARCHY_STANDUP_REMOTE_BUDGET:-120}"
+MAX_REMOTE_TOTAL_BYTES=4000000
+MAX_ORGS=10
+MAX_ORG_REPO_LIST=200
+GH_TIMEOUT="${OMARCHY_STANDUP_GH_TIMEOUT:-60}"
+GH_BIN="${OMARCHY_STANDUP_GH_BIN:-gh}"
 
 log() { printf '%s %s\n' "$(date -Is)" "$*" >>"$LOG_FILE" 2>/dev/null; }
 
@@ -160,6 +185,96 @@ split_roots() {
   done
 }
 
+# Explicit repos and org names are split on comma and newline only. Colon has
+# to survive: it is the separator in git@github.com:owner/repo.git.
+split_list() {
+  printf '%s\n' "$1" | tr ',\n' '\0\0' | while IFS= read -r -d '' item; do
+    item="${item#"${item%%[![:space:]]*}"}"
+    item="${item%"${item##*[![:space:]]}"}"
+    [[ -n $item ]] && { expand_home "$item"; printf '\n'; }
+  done
+}
+
+# ------------------------------------------------------- explicit and remote
+
+# Collapses every spelling of a GitHub repo - owner/name, an https clone URL,
+# an ssh one - down to owner/name. Anything else is refused, because the result
+# is interpolated into a search query and into argv.
+remote_repo_slug() {
+  local e=$1
+  e=${e%/}
+  e=${e%.git}
+  # Peeled in fixed steps - scheme, then userinfo, then host - rather than
+  # matched spelling by spelling, so the steps cannot interfere with each
+  # other. user:token@ is a shape git itself emits; the credential is dropped
+  # here and is never logged, stored or transmitted by this script.
+  e=${e#https://}
+  e=${e#http://}
+  e=${e#git+ssh://}
+  e=${e#ssh://}
+  e=${e#*@}
+  e=${e#github.com/}
+  e=${e#github.com:}
+  e=${e%/}
+  e=${e%.git}
+  [[ $e =~ ^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || return 1
+  printf '%s' "$e"
+}
+
+valid_org() {
+  [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9-]*$ ]]
+}
+
+# An explicit entry is either a checkout on this disk or a repo on GitHub.
+# A directory that exists wins: a local clone has the full history, and the
+# API only ever sees what was pushed.
+# A rejected entry is never echoed. `https://<token>@github.com/o/r` is a
+# spelling git itself emits and CI docs recommend, it is rejected here, and
+# writing it to the log would persist a credential in plaintext for good.
+declare -a EXPLICIT_LOCAL=() EXPLICIT_REMOTE=()
+classify_explicit() {
+  EXPLICIT_LOCAL=()
+  EXPLICIT_REMOTE=()
+  local e slug
+  while IFS= read -r e; do
+    [[ -n $e ]] || continue
+    # A path and a repo slug are decided by shape, not by what happens to exist
+    # right now. Anything anchored - absolute, or explicitly ./ or ../ - is a
+    # path and stays on this machine even when it is missing; anything else can
+    # only ever be owner/name. Without that split a mistyped relative path
+    # silently becomes a search query sent to github.com, so whether a private
+    # project name leaves the machine would depend on the caller's cwd.
+    if [[ $e == /* || $e == ./* || $e == ../* ]]; then
+      if [[ -d $e ]]; then
+        EXPLICIT_LOCAL+=("$e")
+      else
+        log "ignoring repo entry: path does not exist (${#e} chars)"
+      fi
+    elif slug=$(remote_repo_slug "$e"); then
+      EXPLICIT_REMOTE+=("$slug")
+    else
+      log "ignoring unusable repo entry: not a path or owner/name (${#e} chars)"
+    fi
+  done < <(split_list "$1")
+}
+
+declare -a ORG_LIST=()
+classify_orgs() {
+  ORG_LIST=()
+  local o
+  while IFS= read -r o; do
+    [[ -n $o ]] || continue
+    o=${o#@}
+    if ! valid_org "$o"; then
+      log "ignoring unusable org name (${#o} chars)"
+    elif ((${#ORG_LIST[@]} >= MAX_ORGS)); then
+      log "ignoring org beyond the first $MAX_ORGS"
+    else
+      ORG_LIST+=("$o")
+    fi
+  done < <(split_list "$1")
+}
+
 # ---------------------------------------------------------------- repo scan
 
 # Prints "commondir<TAB>worktree" for every git checkout found under the roots.
@@ -179,6 +294,16 @@ scan_repos() {
     done < <(find "$root" -mindepth 2 -maxdepth $((depth + 1)) \
       \( -name node_modules -o -name vendor -o -name .cache -o -name target -o -name dist \) -prune -o \
       -name .git -print 2>/dev/null)
+  done
+}
+
+# Explicit paths skip the find walk entirely: the user named this directory, so
+# it is used as given rather than searched underneath.
+explicit_repos() {
+  local dir
+  for dir in "$@"; do
+    [[ -d $dir ]] || continue
+    emit_repo "$dir"
   done
 }
 
@@ -213,7 +338,273 @@ my_emails() {
   printf '%s\n' "${OMARCHY_STANDUP_EXTRA_EMAILS:-}" | tr ',' '\n'
 }
 
+# -------------------------------------------------------------- remote (API)
+
+# Remote collection is best-effort by design: a missing gh, an expired token or
+# a rate limit must degrade to "local repos only", never take the run down.
+# Both answers are cached for the life of the process. cmd_generate calls
+# collect_json twice whenever the since-last-standup window comes back empty,
+# which is the common case, and without this each of these would be paid twice.
+GH_READY_CACHE=""
+gh_ready() {
+  if [[ -z $GH_READY_CACHE ]]; then
+    if command -v "$GH_BIN" >/dev/null 2>&1 &&
+      timeout "$GH_TIMEOUT" "$GH_BIN" auth status >/dev/null 2>&1; then
+      GH_READY_CACHE=yes
+    else
+      GH_READY_CACHE=no
+    fi
+  fi
+  [[ $GH_READY_CACHE == yes ]]
+}
+
+GH_LOGIN_CACHE=""
+GH_LOGIN_DONE=""
+gh_login() {
+  if [[ -z $GH_LOGIN_DONE ]]; then
+    GH_LOGIN_DONE=yes
+    GH_LOGIN_CACHE=$(timeout "$GH_TIMEOUT" "$GH_BIN" api user --jq '.login' 2>/dev/null)
+    [[ $GH_LOGIN_CACHE =~ ^[A-Za-z0-9-]+$ ]] || GH_LOGIN_CACHE=""
+  fi
+  printf '%s' "$GH_LOGIN_CACHE"
+}
+
+# One line per search to run. GitHub ANDs qualifiers of different kinds, so
+# `author:me author-email:me@example.com` matches only the commits that satisfy
+# both and silently loses the rest; same-kind OR is not documented firmly
+# enough to lean on either. One query per author value avoids the whole
+# question, and the default case is a single query.
+#
+# A blank line means "no author qualifier", which is what author-mode `all`
+# wants. No lines at all means there is nobody to search for.
+remote_author_queries() {
+  local author_mode=$1 authors_raw=$2 login=$3 me_emails=$4 a any=false
+  if [[ $author_mode == all ]]; then
+    printf '\n'
+    return
+  fi
+  if [[ $author_mode == custom ]]; then
+    while IFS= read -r a; do
+      a="${a#"${a%%[![:space:]]*}"}"
+      a="${a%"${a##*[![:space:]]}"}"
+      [[ -n $a ]] || continue
+      if [[ $a =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]+$ ]]; then
+        printf 'author-email:%s\n' "$a"
+        any=true
+      elif [[ $a =~ ^[A-Za-z0-9-]+$ ]]; then
+        printf 'author:%s\n' "$a"
+        any=true
+      else
+        log "author '$a' is not usable as a GitHub search term"
+      fi
+    done < <(printf '%s\n' "$authors_raw" | tr ',' '\n' | sort -u)
+    # Whether or not anything was usable, a custom list is answered only with
+    # the people it named. Falling through to the `me` branch here would search
+    # for the current user and then present the result under authorMode
+    # "custom" - your own commits, attributed to the people you asked about.
+    return
+  fi
+  # author-mode `me`. Local collection matches on every identity the user
+  # commits under, including per-repo work addresses; the remote side has to
+  # cover the same set or an org would silently miss work the local scan finds.
+  {
+    [[ -n $login ]] && printf 'author:%s\n' "$login"
+    while IFS= read -r a; do
+      [[ -n $a ]] || continue
+      [[ $a =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+$ ]] && printf 'author-email:%s\n' "$a"
+    done <<<"$me_emails"
+  } | sort -u
+}
+
+# Streams one compact JSON object per matching commit. Projecting with --jq at
+# the call site keeps a page of search results from arriving as a megabyte of
+# fields nothing reads.
+REMOTE_DEADLINE=0
+remote_budget_left() {
+  ((REMOTE_DEADLINE == 0)) && REMOTE_DEADLINE=$(($(date +%s) + REMOTE_BUDGET_SECONDS))
+  (($(date +%s) < REMOTE_DEADLINE))
+}
+
+gh_search_stream() {
+  local scope=$1 author_q=$2 page=1 out n
+  # SINCE_ISO can come from --since, where anything `date -d` parses is allowed
+  # - including values carrying spaces, which would land in the query as stray
+  # free-text terms rather than as a date range.
+  if [[ ! $SINCE_ISO =~ ^[0-9T:+-]+$ || ! $UNTIL_ISO =~ ^[0-9T:+-]+$ ]]; then
+    log "window is not a plain ISO range; skipping remote collection"
+    return 0
+  fi
+  while ((page <= MAX_REMOTE_PAGES)); do
+    remote_budget_left || {
+      log "remote time budget of ${REMOTE_BUDGET_SECONDS}s exhausted"
+      break
+    }
+    out=$(timeout "$GH_TIMEOUT" "$GH_BIN" api -X GET search/commits \
+      -f q="$scope $author_q author-date:$SINCE_ISO..$UNTIL_ISO" \
+      -f sort=author-date -f order=desc \
+      -f per_page="$MAX_REMOTE_PER_PAGE" -f page="$page" \
+      --jq '.items[] | {sha:.sha, repo:(.repository.full_name // ""),
+                        an:(.commit.author.name // ""), ae:(.commit.author.email // ""),
+                        d:(.commit.author.date // ""),
+                        s:((.commit.message // "") | split("\n")[0])}' \
+      2>/dev/null | head -c "$MAX_REMOTE_BYTES")
+    [[ -n $out ]] || break
+    printf '%s\n' "$out"
+    n=$(printf '%s\n' "$out" | grep -c '^{')
+    ((n < MAX_REMOTE_PER_PAGE)) && break
+    page=$((page + 1))
+    # Still a full page on the way out of the loop means the cap stopped us,
+    # not the data running out. gh_search_stream runs in a command
+    # substitution, so this cannot be reported through a variable.
+    ((page > MAX_REMOTE_PAGES)) && printf '{"__page_cap__":true}\n'
+  done
+}
+
+# Groups the commit stream into repo entries shaped exactly like the ones the
+# local scan produces, dropping every commit already reported from a clone on
+# this disk so a cloned org repo is not counted twice.
+REMOTE_JSON="[]"
+REMOTE_WARNING=""
+REMOTE_TRUNCATED=false
+collect_remote() {
+  local author_mode=$1 authors_raw=$2 local_shas=$3 me_emails=${4:-}
+  REMOTE_JSON="[]"
+  REMOTE_WARNING=""
+  REMOTE_TRUNCATED=false
+
+  local -a scope=()
+  local o r
+  for o in ${ORG_LIST[@]+"${ORG_LIST[@]}"}; do scope+=("org:$o"); done
+  for r in ${EXPLICIT_REMOTE[@]+"${EXPLICIT_REMOTE[@]}"}; do scope+=("repo:$r"); done
+  ((${#scope[@]})) || return 0
+
+  if ! gh_ready; then
+    REMOTE_WARNING="GitHub not reachable (gh missing or not logged in) - used local repos only"
+    log "$REMOTE_WARNING"
+    return 0
+  fi
+
+  # Resolved here rather than inside the loop below: that loop reads from a
+  # process substitution, and a cache populated in that subshell dies with it.
+  local login=""
+  login=$(gh_login)
+
+  local stream="" aq chunk ran=false queries=0
+  while IFS= read -r aq; do
+    if ((queries >= MAX_AUTHOR_QUERIES)); then
+      # Dropping people silently would under-report their work as "no commits".
+      REMOTE_WARNING="only the first $MAX_AUTHOR_QUERIES selected authors were searched on GitHub"
+      log "$REMOTE_WARNING"
+      break
+    fi
+    queries=$((queries + 1))
+    ran=true
+    chunk=$(gh_search_stream "${scope[*]}" "$aq")
+    [[ -n $chunk ]] && stream+="$chunk"$'\n'
+    if ((${#stream} > MAX_REMOTE_TOTAL_BYTES)); then
+      REMOTE_WARNING="remote results hit the size ceiling; some authors were not searched"
+      REMOTE_TRUNCATED=true
+      log "$REMOTE_WARNING"
+      break
+    fi
+  done < <(remote_author_queries "$author_mode" "$authors_raw" "$login" "$me_emails")
+
+  if [[ $ran == false ]]; then
+    if [[ $author_mode == custom ]]; then
+      REMOTE_WARNING="none of the selected authors could be searched for on GitHub - org and remote repos were skipped"
+    else
+      REMOTE_WARNING="no GitHub identity to search for - set a git email or log in with gh"
+    fi
+    log "$REMOTE_WARNING"
+    return 0
+  fi
+
+  [[ $stream == *'"__page_cap__"'* ]] && REMOTE_TRUNCATED=true
+
+  REMOTE_JSON=$(printf '%s' "$stream" |
+    LOCAL_SHAS="$local_shas" LIMIT=$MAX_COMMITS_PER_REPO SUBJ=$MAX_SUBJECT_LEN python3 -c '
+import collections, json, os, sys
+limit = int(os.environ["LIMIT"]); subj = int(os.environ["SUBJ"])
+local = {l.strip().lower() for l in os.environ.get("LOCAL_SHAS", "").split("\n") if l.strip()}
+repos, seen = collections.OrderedDict(), set()
+for line in sys.stdin:
+    line = line.strip()
+    if not line.startswith("{"):
+        continue
+    try:
+        c = json.loads(line)
+    except ValueError:
+        continue
+    sha = str(c.get("sha") or "")
+    full = str(c.get("repo") or "")
+    # A commit already found in a clone on this disk is the same work; the
+    # local copy wins because it carries the branch it sits on.
+    if not sha or not full or sha.lower() in local or sha in seen:
+        continue
+    seen.add(sha)
+    e = repos.setdefault(full, {"name": full.split("/")[-1], "path": full, "slug": full,
+                                "source": "github", "branch": "", "commits": []})
+    if len(e["commits"]) >= limit:
+        continue
+    e["commits"].append({"h": sha[:8], "an": str(c.get("an") or "")[:60],
+                         "ae": str(c.get("ae") or "")[:80],
+                         "d": str(c.get("d") or "")[:16].replace("T", " "),
+                         "s": str(c.get("s") or "")[:subj]})
+json.dump([e for e in repos.values() if e["commits"]], sys.stdout, ensure_ascii=False)
+' 2>/dev/null)
+  printf '%s' "$REMOTE_JSON" | jq -e 'type == "array"' >/dev/null 2>&1 || REMOTE_JSON="[]"
+}
+
+# Folds the remote entries into the local ones. A repo that exists both as a
+# clone and on GitHub stays one line in the standup.
+#
+# The whole-digest commit budget is spent here, not only the per-repo one. The
+# local walk stops at MAX_COMMITS_TOTAL on its own, so without carrying that
+# budget across the append path an organization would add its own full quota on
+# top and the prompt would be twice the size the cap exists to guarantee.
+# Reports the totals it actually produced rather than leaving the caller to
+# recount, since the caller cannot see where the budget ran out.
+merge_repos() { # merge_repos <local-json> <remote-json>
+  LIMIT=$MAX_COMMITS_PER_REPO TOTAL=$MAX_COMMITS_TOTAL python3 -c '
+import json, os, sys
+limit = int(os.environ["LIMIT"]); cap = int(os.environ["TOTAL"])
+local = json.loads(sys.argv[1]); remote = json.loads(sys.argv[2])
+by_slug = {}
+for e in local:
+    slug = str(e.get("slug") or "").lower()
+    if slug:
+        by_slug.setdefault(slug, e)
+out = list(local)
+total = sum(len(e["commits"]) for e in local)
+truncated = False
+for r in remote:
+    if total >= cap:
+        truncated = True
+        break
+    target = by_slug.get(str(r.get("slug") or "").lower())
+    if target is None:
+        room = min(len(r["commits"]), cap - total)
+        if room < len(r["commits"]):
+            truncated = True
+        r["commits"] = r["commits"][:room]
+        if r["commits"]:
+            out.append(r)
+            total += room
+        continue
+    room = min(limit - len(target["commits"]), cap - total)
+    if room > 0:
+        target["commits"].extend(r["commits"][:room])
+        target["source"] = "local+github"
+        total += min(room, len(r["commits"]))
+    if room < len(r["commits"]):
+        truncated = True
+json.dump({"repos": [e for e in out if e["commits"]], "total": total,
+           "truncated": truncated}, sys.stdout, ensure_ascii=False)
+' "$1" "$2"
+}
+
 # --------------------------------------------------------------- collection
+
 
 # Sets SINCE_ISO / UNTIL_ISO for this run.
 resolve_window() {
@@ -256,12 +647,25 @@ clamp_window() {
 
 collect_json() {
   local roots_raw=$1 depth=$2 mode=$3 days=$4 explicit=$5 author_mode=$6 authors_raw=$7
+  local repos_raw=${8:-} orgs_raw=${9:-}
+
   local -a roots=()
   while IFS= read -r r; do [[ -n $r ]] && roots+=("$r"); done < <(split_roots "$roots_raw")
-  ((${#roots[@]})) || die "no project folders configured"
+  classify_explicit "$repos_raw"
+  classify_orgs "$orgs_raw"
+
+  # Any one of the three sources is enough. Only a run with nothing at all
+  # pointed at it is a misconfiguration.
+  ((${#roots[@]} + ${#EXPLICIT_LOCAL[@]} + ${#EXPLICIT_REMOTE[@]} + ${#ORG_LIST[@]})) ||
+    die "no project folders, repos or organizations configured"
 
   local -a repos=()
-  while IFS= read -r r; do [[ -n $r ]] && repos+=("$r"); done < <(scan_repos "$depth" "${roots[@]}" | unique_repos)
+  while IFS= read -r r; do [[ -n $r ]] && repos+=("$r"); done < <(
+    {
+      ((${#roots[@]})) && scan_repos "$depth" "${roots[@]}"
+      ((${#EXPLICIT_LOCAL[@]})) && explicit_repos "${EXPLICIT_LOCAL[@]}"
+    } | unique_repos
+  )
 
   resolve_window "$mode" "$days" "$explicit"
   clamp_window "$days"
@@ -279,18 +683,23 @@ collect_json() {
     # user's own identities instead.
     ((${#author_args[@]})) || author_mode=me
   fi
+  local me_emails=""
   if [[ $author_mode == me ]]; then
     local e
+    me_emails=$(printf '%s\n' ${repos[@]+"${repos[@]}"} | my_emails | sort -u)
     while IFS= read -r e; do
       [[ -n $e ]] && author_args+=(--author="$e")
-    done < <(printf '%s\n' "${repos[@]}" | my_emails | sort -u)
+    done <<<"$me_emails"
     # No git identity configured anywhere: the login name is the last clue left.
     ((${#author_args[@]})) || author_args=(--author="$(whoami)")
   fi
 
   local total=0 truncated=false
   local repos_json="[]" dir
-  for dir in "${repos[@]}"; do
+  # Full hashes of everything found locally, so the same commit arriving from
+  # the API can be recognised and dropped.
+  local local_shas=""
+  for dir in ${repos[@]+"${repos[@]}"}; do
     ((total >= MAX_COMMITS_TOTAL)) && {
       truncated=true
       break
@@ -338,16 +747,43 @@ json.dump(out, sys.stdout, ensure_ascii=False)
     n=$(printf '%s' "$commits_json" | jq 'length')
     ((n == 0)) && continue
     total=$((total + n))
+    # Every hash in the window, not just the ones that made the per-repo cut:
+    # a commit trimmed here is still one the API copy should not re-report.
+    local_shas+=$(printf '%s' "$raw" | tr '\036' '\n' | cut -d$'\037' -f1)$'\n'
+
+    # The origin slug is what lets a clone and its GitHub counterpart collapse
+    # into one project instead of appearing twice.
+    local slug=""
+    slug=$(remote_repo_slug "$(git -C "$dir" remote get-url origin 2>/dev/null)" 2>/dev/null) || slug=""
 
     repos_json=$(jq -c --arg name "$(basename "$dir")" --arg path "$dir" --arg branch "$branch" \
-      --argjson commits "$commits_json" \
-      '. + [{name:$name, path:$path, branch:$branch, commits:$commits}]' <<<"$repos_json")
+      --arg slug "$slug" --argjson commits "$commits_json" \
+      '. + [{name:$name, path:$path, branch:$branch, slug:$slug, source:"local", commits:$commits}]' <<<"$repos_json")
   done
+
+  collect_remote "$author_mode" "$authors_raw" "$local_shas" "$me_emails"
+  [[ $REMOTE_TRUNCATED == true ]] && truncated=true
+  if [[ $REMOTE_JSON != "[]" ]]; then
+    local merged
+    merged=$(merge_repos "$repos_json" "$REMOTE_JSON" 2>/dev/null)
+    if printf '%s' "$merged" | jq -e '(type == "object") and (.repos | type == "array")' >/dev/null 2>&1; then
+      repos_json=$(jq -c '.repos' <<<"$merged")
+      total=$(jq -r '.total' <<<"$merged")
+      [[ $(jq -r '.truncated' <<<"$merged") == true ]] && truncated=true
+    fi
+  fi
+
+  local warnings="[]"
+  [[ -n $REMOTE_WARNING ]] && warnings=$(jq -nc --arg w "$REMOTE_WARNING" '[$w]')
+
+  local orgs_json="[]"
+  ((${#ORG_LIST[@]})) && orgs_json=$(printf '%s\n' "${ORG_LIST[@]}" | jq -Rnc '[inputs | select(length > 0)]')
 
   jq -nc --arg since "$SINCE_ISO" --arg until "$UNTIL_ISO" --arg mode "$author_mode" \
     --argjson repos "$repos_json" --argjson total "$total" --argjson trunc "$truncated" \
+    --argjson warnings "$warnings" --argjson orgs "$orgs_json" \
     '{ok:true, since:$since, until:$until, authorMode:$mode, repoCount:($repos|length),
-      commitCount:$total, truncated:$trunc, repos:$repos}'
+      commitCount:$total, truncated:$trunc, orgs:$orgs, warnings:$warnings, repos:$repos}'
 }
 
 # ------------------------------------------------------------------- agents
@@ -499,7 +935,7 @@ run_agent() {
 digest_markdown() {
   jq -r '
     .repos[] |
-    "## " + .name + " (" + .branch + ")",
+    "## " + .name + (if (.branch // "") == "" then "" else " (" + .branch + ")" end),
     (.commits[] | "- " + .d + " [" + .an + "] " + .s),
     ""
   ' <<<"$1"
@@ -574,10 +1010,13 @@ fallback_bullets() {
 
 cmd_generate() {
   local roots="" depth=2 mode=auto days=1 explicit="" author_mode=me authors=""
+  local repos_opt="" orgs_opt=""
   local agent=default custom="" max_bullets=5 force=false format_text=""
   while (($#)); do
     case "$1" in
     --roots) roots=$2; shift 2 ;;
+    --repos) repos_opt=$2; shift 2 ;;
+    --orgs) orgs_opt=$2; shift 2 ;;
     --depth) depth=$2; shift 2 ;;
     --window) mode=$2; shift 2 ;;
     --days) days=$2; shift 2 ;;
@@ -613,7 +1052,7 @@ cmd_generate() {
   read_state | jq -c '.running = true | .lastStatus = "collecting"' | write_atomic "$STATE_FILE"
 
   local digest
-  digest=$(collect_json "$roots" "$depth" "$mode" "$days" "$explicit" "$author_mode" "$authors")
+  digest=$(collect_json "$roots" "$depth" "$mode" "$days" "$explicit" "$author_mode" "$authors" "$repos_opt" "$orgs_opt")
   if [[ $(jq -r '.ok' <<<"$digest" 2>/dev/null) != true ]]; then
     finish_state "error"
     printf '%s\n' "$digest"
@@ -630,7 +1069,7 @@ cmd_generate() {
   # work that is actually there.
   if ((count == 0)) && [[ $mode == auto && -z $explicit ]]; then
     local wide
-    wide=$(collect_json "$roots" "$depth" fixed "$days" "" "$author_mode" "$authors")
+    wide=$(collect_json "$roots" "$depth" fixed "$days" "" "$author_mode" "$authors" "$repos_opt" "$orgs_opt")
     if [[ $(jq -r '.ok' <<<"$wide" 2>/dev/null) == true ]] && (($(jq -r '.commitCount' <<<"$wide") > 0)); then
       digest=$wide
       count=$(jq -r '.commitCount' <<<"$digest")
@@ -646,7 +1085,8 @@ cmd_generate() {
     # Nothing happened in the window. Recording the run anyway keeps the auto
     # window moving forward instead of re-scanning the same empty span forever.
     finish_state "empty"
-    jq -nc --argjson d "$digest" '{ok:true, generated:false, reason:"no commits", digest:$d}'
+    jq -nc --argjson d "$digest" --argjson w "$(jq -c '.warnings // []' <<<"$digest")" \
+      '{ok:true, generated:false, reason:"no commits", warnings:$w, digest:$d}'
     return 0
   fi
 
@@ -681,25 +1121,31 @@ cmd_generate() {
   entry="$ENTRIES_DIR/$ts.md"
   printf '%s\n' "$body" | write_atomic "$entry"
 
-  local since until
+  local since until warnings
   since=$(jq -r '.since' <<<"$digest")
   until=$(jq -r '.until' <<<"$digest")
+  # A scheduled run that could not reach GitHub still writes a standup, and
+  # without this the entry would look complete while silently missing every org
+  # repo. The warning rides along with the entry so the panel can say so.
+  warnings=$(jq -c '.warnings // []' <<<"$digest")
 
   jq -c --arg id "$ts" --argjson ts "$ts" --arg date "$(date -d "@$ts" +%Y-%m-%d)" \
     --arg since "$since" --arg until "$until" --arg agent "$resolved" \
     --argjson commits "$count" --argjson repos "$(jq -r '.repoCount' <<<"$digest")" \
     --argjson fallback "$used_fallback" --argjson manual "$force" --argjson widened "$widened" \
+    --argjson warnings "$warnings" \
     '.entries = ([{id:$id, ts:$ts, date:$date, since:$since, until:$until, agent:$agent,
                    commits:$commits, repos:$repos, fallback:$fallback, manual:$manual,
-                   widened:$widened}]
+                   widened:$widened, warnings:$warnings}]
                  + [.entries[] | select((.manual and $manual and .date == $date) | not)])[:60]' \
     <<<"$(read_index)" | write_atomic "$INDEX_FILE"
 
   prune_entries
   finish_state "ok"
   jq -nc --arg id "$ts" --arg body "$body" --argjson commits "$count" --argjson fallback "$used_fallback" \
-    --argjson widened "$widened" \
-    '{ok:true, generated:true, id:$id, body:$body, commits:$commits, fallback:$fallback, widened:$widened}'
+    --argjson widened "$widened" --argjson warnings "$warnings" \
+    '{ok:true, generated:true, id:$id, body:$body, commits:$commits, fallback:$fallback,
+      widened:$widened, warnings:$warnings}'
 }
 
 finish_state() {
@@ -808,31 +1254,99 @@ cmd_delete() {
 }
 
 cmd_repos() {
-  local roots=${1:-} depth=${2:-2}
+  local roots=${1:-} depth=${2:-2} repos_raw=${3:-} orgs_raw=${4:-}
   local -a rootv=()
   while IFS= read -r r; do [[ -n $r ]] && rootv+=("$r"); done < <(split_roots "$roots")
-  ((${#rootv[@]})) || die "no project folders configured"
-  local out="[]" dir
+  classify_explicit "$repos_raw"
+  classify_orgs "$orgs_raw"
+  ((${#rootv[@]} + ${#EXPLICIT_LOCAL[@]} + ${#EXPLICIT_REMOTE[@]} + ${#ORG_LIST[@]})) ||
+    die "no project folders, repos or organizations configured"
+
+  local out="[]" dir slug org
   while IFS= read -r dir; do
     [[ -n $dir ]] || continue
-    out=$(jq -c --arg name "$(basename "$dir")" --arg path "$dir" '. + [{name:$name, path:$path}]' <<<"$out")
-  done < <(scan_repos "$depth" "${rootv[@]}" | unique_repos)
-  jq -nc --argjson repos "$out" '{ok:true, count:($repos|length), repos:$repos}'
+    # Carried so a clone and the org listing of the same repo collapse into one
+    # line here, the way they do in the digest.
+    slug=$(remote_repo_slug "$(git -C "$dir" remote get-url origin 2>/dev/null)" 2>/dev/null) || slug=""
+    out=$(jq -c --arg name "$(basename "$dir")" --arg path "$dir" --arg slug "$slug" \
+      '. + [{name:$name, path:$path, slug:$slug, source:"local"}]' <<<"$out")
+  done < <(
+    {
+      ((${#rootv[@]})) && scan_repos "$depth" "${rootv[@]}"
+      ((${#EXPLICIT_LOCAL[@]})) && explicit_repos "${EXPLICIT_LOCAL[@]}"
+    } | unique_repos
+  )
+
+  for slug in ${EXPLICIT_REMOTE[@]+"${EXPLICIT_REMOTE[@]}"}; do
+    out=$(jq -c --arg name "${slug##*/}" --arg path "$slug" --arg slug "$slug" \
+      '. + [{name:$name, path:$path, slug:$slug, source:"github"}]' <<<"$out")
+  done
+
+  # Org membership is a live question, so the count only means anything if the
+  # API can actually be reached. Nothing is invented when it cannot.
+  #
+  # This lists what is *visible* in the org, which is deliberately not the same
+  # set the digest reports: the digest covers only repos you committed to in the
+  # window. The count is a reachability check - "the org resolves and has this
+  # many repos" - and the panel labels it as scope, not as standup content.
+  local warnings="[]" listed=0
+  if ((${#ORG_LIST[@]})); then
+    if gh_ready; then
+      for org in "${ORG_LIST[@]}"; do
+        listed=0
+        while IFS= read -r slug; do
+          [[ $slug == */* ]] || continue
+          listed=$((listed + 1))
+          out=$(jq -c --arg name "${slug##*/}" --arg path "$slug" --arg slug "$slug" \
+            '. + [{name:$name, path:$path, slug:$slug, source:"github"}]' <<<"$out")
+        done < <(timeout "$GH_TIMEOUT" "$GH_BIN" repo list "$org" --limit "$MAX_ORG_REPO_LIST" \
+          --json nameWithOwner --jq '.[].nameWithOwner' 2>/dev/null)
+        ((listed >= MAX_ORG_REPO_LIST)) &&
+          warnings=$(jq -nc --arg o "$org" --argjson n "$MAX_ORG_REPO_LIST" \
+            '["only the first \($n) repos of \($o) were counted; the standup itself is not limited this way"]')
+      done
+    else
+      warnings=$(jq -nc '["GitHub not reachable (gh missing or not logged in) - organization repos not counted"]')
+    fi
+  fi
+
+  # A clone of an org repo is one project, listed once. The origin slug is the
+  # identity where there is one, so the clone and the API listing collapse; a
+  # repo with no GitHub origin falls back to its path.
+  out=$(jq -c 'reduce .[] as $r ({seen:{}, list:[]};
+        ((if ($r.slug // "") == "" then $r.path else $r.slug end) | ascii_downcase) as $k |
+        if .seen[$k] then . else .seen[$k] = true | .list += [$r] end) | .list' <<<"$out")
+
+  jq -nc --argjson repos "$out" --argjson warnings "$warnings" \
+    '{ok:true, count:($repos|length), warnings:$warnings, repos:$repos}'
 }
 
 # Feeds the author picker in settings: who actually shows up in these repos.
 cmd_authors() {
-  local roots=${1:-} depth=${2:-2} days=${3:-30} format=${4:-full}
+  local roots=${1:-} depth=${2:-2} days=${3:-30} format=${4:-full} repos_raw=${5:-}
   local -a rootv=()
   while IFS= read -r r; do [[ -n $r ]] && rootv+=("$r"); done < <(split_roots "$roots")
-  ((${#rootv[@]})) || die "no project folders configured"
+  classify_explicit "$repos_raw"
+  # The picker offers the people who show up in local history. An org-only
+  # setup has no local history to read, so it offers nobody rather than failing
+  # the settings page.
+  ((${#rootv[@]} + ${#EXPLICIT_LOCAL[@]})) || {
+    [[ $format == options ]] && { printf '[]'; return 0; }
+    jq -nc '{ok:true, authors:[]}'
+    return 0
+  }
   local dir since
   since=$(date -Is -d "$days days ago")
   {
     while IFS= read -r dir; do
       [[ -n $dir ]] || continue
       git -C "$dir" log --all --no-merges --since="$since" --pretty=format:'%an%x1f%ae%x1e' 2>/dev/null
-    done < <(scan_repos "$depth" "${rootv[@]}" | unique_repos)
+    done < <(
+      {
+        ((${#rootv[@]})) && scan_repos "$depth" "${rootv[@]}"
+        ((${#EXPLICIT_LOCAL[@]})) && explicit_repos "${EXPLICIT_LOCAL[@]}"
+      } | unique_repos
+    )
   } | head -c "$MAX_SCAN_BYTES" | FORMAT="$format" python3 -c '
 import json, os, sys, collections
 raw = sys.stdin.buffer.read().decode("utf-8", "replace")
@@ -865,17 +1379,25 @@ usage() {
   cat >&2 <<'USAGE'
 standup.sh <command> [options]
 
-  generate [--roots S] [--depth N] [--window auto|fixed] [--days N] [--since ISO]
-           [--author-mode me|all|custom] [--authors S] [--agent ID|default|custom]
-           [--custom-command CMD] [--max-bullets N] [--format-text S] [--force]
+  generate [--roots S] [--repos S] [--orgs S] [--depth N] [--window auto|fixed]
+           [--days N] [--since ISO] [--author-mode me|all|custom] [--authors S]
+           [--agent ID|default|custom] [--custom-command CMD] [--max-bullets N]
+           [--format-text S] [--force]
   collect  same scan options as generate; prints the digest without calling an agent
+
+  --roots  folders to walk for git checkouts (comma, newline or colon separated)
+  --repos  individual repos, comma or newline separated: a path on this machine,
+           or a GitHub repo as owner/name or a clone URL
+  --orgs   GitHub organizations, comma separated. Every repo in the org that you
+           committed to in the window is included, whether or not it is cloned
+           here; needs the gh CLI logged in
   list     index of stored standups
   status   unread count, latest entry, run state
   show     [id]
   seen     [ts]
   delete   <id>
-  repos    <roots> [depth]
-  authors  <roots> [depth] [days]
+  repos    <roots> [depth] [repos] [orgs]
+  authors  <roots> [depth] [days] [format] [repos]
   agents   available coding agents and the configured default
 USAGE
   exit 2
@@ -892,9 +1414,12 @@ main() {
   generate) cmd_generate "$@" ;;
   collect)
     local roots="" depth=2 mode=auto days=1 explicit="" author_mode=me authors=""
+    local repos_opt="" orgs_opt=""
     while (($#)); do
       case "$1" in
       --roots) roots=$2; shift 2 ;;
+      --repos) repos_opt=$2; shift 2 ;;
+      --orgs) orgs_opt=$2; shift 2 ;;
       --depth) depth=$2; shift 2 ;;
       --window) mode=$2; shift 2 ;;
       --days) days=$2; shift 2 ;;
@@ -904,7 +1429,7 @@ main() {
       *) shift ;;
       esac
     done
-    collect_json "$roots" "$depth" "$mode" "$days" "$explicit" "$author_mode" "$authors"
+    collect_json "$roots" "$depth" "$mode" "$days" "$explicit" "$author_mode" "$authors" "$repos_opt" "$orgs_opt"
     ;;
   list) cmd_list ;;
   status) cmd_status ;;

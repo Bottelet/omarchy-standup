@@ -22,6 +22,7 @@ Panel {
 
   readonly property color fg: bar ? bar.foreground : Color.foreground
   readonly property color dim: Qt.darker(fg, 1.4)
+  readonly property color warn: Color.accent
   readonly property string fontName: bar ? bar.fontFamily : Style.font.family
 
   readonly property string scriptPath: Qt.resolvedUrl("scripts/standup.sh").toString().replace("file://", "")
@@ -35,6 +36,10 @@ Panel {
   property bool busy: false
   property string lastError: ""
   property int repoCount: -1
+  // Set when the count could not include everything that was asked for -
+  // organizations need the gh CLI, and a number that quietly left them out
+  // would read as "the org is empty".
+  property string repoWarning: ""
 
   // "main" | "history" | "settings"
   property string page: "main"
@@ -261,6 +266,8 @@ Panel {
       onStreamFinished: {
         var data = Model.parseJson(text)
         root.repoCount = data && data.count !== undefined ? Number(data.count) : -1
+        root.repoWarning = data && data.warnings instanceof Array && data.warnings.length > 0
+                           ? String(data.warnings[0]) : ""
       }
     }
   }
@@ -314,7 +321,8 @@ Panel {
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
-      blocked: rootsField.activeFocus || timeField.activeFocus || customField.activeFocus || formatField.activeFocus
+      blocked: rootsField.activeFocus || reposField.activeFocus || orgsField.activeFocus
+               || timeField.activeFocus || customField.activeFocus || formatField.activeFocus
       onCloseRequested: {
         if (root.page !== "main") root.page = "main"
         else root.close()
@@ -610,25 +618,33 @@ Panel {
               width: parent.width
               spacing: Style.space(4)
 
+              Text {
+                text: "Folders to scan"
+                textFormat: Text.PlainText
+                color: root.dim
+                font.family: root.fontName
+                font.pixelSize: Style.font.caption
+              }
+
               TextField {
                 id: rootsField
                 width: parent.width
                 text: String(root.cfg.roots)
+                placeholderText: "~/Projects"
                 foreground: root.fg
                 font.family: root.fontName
                 font.pixelSize: Style.font.body
                 onEditingFinished: {
                   root.persistSettings({ roots: text })
                   root.repoCount = -1
+                  root.repoWarning = ""
                   root.countRepos()
                 }
               }
 
               Text {
                 width: parent.width
-                text: root.repoCount >= 0
-                      ? root.repoCount + " git project" + (root.repoCount === 1 ? "" : "s") + " found (worktrees counted once)"
-                      : "Folders to scan, separated by commas. Sub-folders are scanned too."
+                text: "Separated by commas. Sub-folders are scanned too."
                 textFormat: Text.PlainText
                 color: root.dim
                 font.family: root.fontName
@@ -648,6 +664,102 @@ Panel {
                 root.persistSettings({ scanDepth: v })
                 root.countRepos()
               }
+            }
+
+            Column {
+              width: parent.width
+              spacing: Style.space(4)
+
+              Text {
+                text: "Individual repos"
+                textFormat: Text.PlainText
+                color: root.dim
+                font.family: root.fontName
+                font.pixelSize: Style.font.caption
+              }
+
+              TextField {
+                id: reposField
+                width: parent.width
+                text: String(root.cfg.repos)
+                placeholderText: "~/code/thing, owner/repo"
+                foreground: root.fg
+                font.family: root.fontName
+                font.pixelSize: Style.font.body
+                onEditingFinished: {
+                  root.persistSettings({ repos: text })
+                  root.repoCount = -1
+                  root.repoWarning = ""
+                  root.countRepos()
+                }
+              }
+
+              Text {
+                width: parent.width
+                text: "Repos to include wherever they live: a path on this machine, or a GitHub repo as owner/name."
+                textFormat: Text.PlainText
+                color: root.dim
+                font.family: root.fontName
+                font.pixelSize: Style.font.caption
+                wrapMode: Text.WordWrap
+              }
+            }
+
+            Column {
+              width: parent.width
+              spacing: Style.space(4)
+
+              Text {
+                text: "GitHub organizations"
+                textFormat: Text.PlainText
+                color: root.dim
+                font.family: root.fontName
+                font.pixelSize: Style.font.caption
+              }
+
+              TextField {
+                id: orgsField
+                width: parent.width
+                text: String(root.cfg.orgs)
+                placeholderText: "acme-inc"
+                foreground: root.fg
+                font.family: root.fontName
+                font.pixelSize: Style.font.body
+                onEditingFinished: {
+                  root.persistSettings({ orgs: text })
+                  root.repoCount = -1
+                  root.repoWarning = ""
+                  root.countRepos()
+                }
+              }
+
+              Text {
+                width: parent.width
+                text: "Every repo in the org you committed to, cloned here or not. Needs the gh CLI logged in."
+                textFormat: Text.PlainText
+                color: root.dim
+                font.family: root.fontName
+                font.pixelSize: Style.font.caption
+                wrapMode: Text.WordWrap
+              }
+            }
+
+            // One line for the whole section: what is pointed at, and what that
+            // actually resolved to the last time it was counted.
+            Text {
+              width: parent.width
+              text: root.repoWarning !== ""
+                    ? root.repoWarning
+                    : (root.repoCount >= 0
+                       ? Model.sourceSummary(root.settings) + " - "
+                         + root.repoCount + " repo" + (root.repoCount === 1 ? "" : "s")
+                         + " in scope (the standup covers the ones you committed to)"
+                       : Model.sourceSummary(root.settings))
+              textFormat: Text.PlainText
+              color: root.repoWarning !== "" ? root.warn : root.dim
+              font.family: root.fontName
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
             }
 
             PanelSectionHeader {

@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "bottelet.standup",
   "name": "Standup",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "Casper Bottelet",
   "license": "MIT",
-  "description": "Generates a short daily standup from the git activity across all your project folders, on a schedule you set, using your default Omarchy coding agent (or any local model). Bar icon badges when a new standup is waiting.",
+  "description": "Generates a short daily standup from your git activity - across your project folders, any repos you name explicitly, and every repo in a GitHub organization you belong to, cloned or not. Runs on a schedule you set, using your default Omarchy coding agent (or any local model). Bar icon badges when a new standup is waiting.",
   "kinds": [
     "bar-widget"
   ],
@@ -19,6 +19,8 @@
     "allowMultiple": false,
     "defaults": {
       "roots": "~/Projects",
+      "repos": "",
+      "orgs": "",
       "scanDepth": 2,
       "windowMode": "auto",
       "days": 1,
