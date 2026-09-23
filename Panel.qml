@@ -34,6 +34,12 @@ Panel {
   property string currentId: ""
   property string bodyText: ""
   property bool busy: false
+  // busy doubles as a UI spinner and is refreshed from the state file on every
+  // status poll, so it cannot also be the guard against starting a second run:
+  // a poll sampled before the new run marked itself running comes back
+  // running:false and clears it mid-flight. This tracks a run started by this
+  // panel and is cleared only when that run's own process reports back.
+  property bool generating: false
   property string lastError: ""
   property int repoCount: -1
   // Set when the count could not include everything that was asked for -
@@ -81,14 +87,16 @@ Panel {
   }
 
   function generateNow() {
-    if (root.busy) return
+    if (root.busy || root.generating) return
+    root.generating = true
     root.busy = true
     root.lastError = ""
     run(generateProc, Model.generateArgs(root.settings, true))
   }
 
   function generateScheduled() {
-    if (root.busy) return
+    if (root.busy || root.generating) return
+    root.generating = true
     root.busy = true
     run(generateProc, Model.generateArgs(root.settings, false))
   }
@@ -181,7 +189,14 @@ Panel {
         var data = Model.parseJson(text)
         if (!data) return
         root.statusData = data
-        root.busy = data.running === true
+        if (!root.generating) root.busy = data.running === true
+        // Decided here rather than on the timer tick: the tick asks for status
+        // and then read root.statusData on the next line, which is always the
+        // previous sample. A run that had just finished and moved lastRunTs
+        // was therefore invisible, and the schedule fired a second time.
+        if (!root.generating && !root.busy
+            && Model.scheduleDue(root.settings, new Date(), data.lastRunTs))
+          root.generateScheduled()
       }
     }
   }
@@ -228,6 +243,7 @@ Panel {
       waitForEnd: true
       onStreamFinished: {
         var data = Model.parseJson(text)
+        root.generating = false
         root.busy = false
         if (!data || data.ok !== true) {
           root.lastError = data && data.error ? String(data.error) : "generation failed"
@@ -243,6 +259,7 @@ Panel {
       }
     }
     onExited: function(code) {
+      root.generating = false
       root.busy = false
       if (code !== 0 && root.lastError === "") root.lastError = "generation failed"
     }
@@ -280,11 +297,10 @@ Panel {
     repeat: true
     triggeredOnStart: true
     onTriggered: {
+      // Only asks. Whether a run is due is decided when the answer arrives,
+      // against that answer rather than against the previous one.
       root.refreshStatus()
       root.refreshIndex()
-      if (!root.busy && root.statusData
-          && Model.scheduleDue(root.settings, new Date(), root.statusData.lastRunTs))
-        root.generateScheduled()
     }
   }
 

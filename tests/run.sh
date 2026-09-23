@@ -198,6 +198,35 @@ contains "the chosen format is in the prompt" "saw the format text" "$BODY"
 contains "the bullet cap is in the prompt" "saw the bullet cap" "$BODY"
 
 echo
+echo "== who the standup is written for =="
+cat >"$STUB/claude" <<'STUBEOF'
+#!/usr/bin/env bash
+prompt=$(cat)
+printf '<standup>\n'
+[[ $prompt == *"update for the team"* ]] && printf -- '- team\n'
+[[ $prompt == *"update for the developer"* ]] && printf -- '- developer\n'
+printf '</standup>\n'
+STUBEOF
+
+whofor() { # whofor <author-mode> [authors]
+  local mode=$1 authors=${2:-}
+  local -a extra=()
+  [[ -n $authors ]] && extra=(--authors "$authors")
+  PATH="$STUB:$PATH" "$ENGINE" generate --roots "$ROOTS" --window fixed --days 400 \
+    --agent claude --force --author-mode "$mode" "${extra[@]}" | jq -r '.body'
+}
+
+check "only me is one developer" "- developer" "$(whofor me)"
+check "everyone is a team" "- team" "$(whofor all)"
+# A hand-picked list of several people is a team standup too. Calling it "the
+# developer" made the agent fold everyone's work under a single name.
+check "several picked people are a team" "- team" \
+  "$(whofor custom "me@example.com,her@example.com,him@example.com")"
+check "one picked person is still one developer" "- developer" \
+  "$(whofor custom "me@example.com")"
+check "a trailing comma does not invent a second person" "- developer" \
+  "$(whofor custom "me@example.com,")"
+
 echo "== fallback when no agent answers =="
 cat >"$STUB/claude" <<'STUBEOF'
 #!/usr/bin/env bash
@@ -234,8 +263,28 @@ check "empty custom command falls back" "true" "$(jq -r '.fallback' <<<"$OUT")"
 
 echo
 echo "== index, unread and history =="
+# Seeded rather than generated: one standup is kept per day per kind, so a
+# run loop can no longer build a multi-entry history within a single day.
+# These commands are about reading and pruning an existing history anyway.
+seed_history() {
+  local i ts day
+  : >"$OMARCHY_STANDUP_STATE/index.json"
+  local entries="[]"
+  for i in 0 1 2 3; do
+    ts=$((1700000000 - i * 86400))
+    day=$(date -d "@$ts" +%Y-%m-%d)
+    printf -- '- seeded entry %d\n' "$i" >"$OMARCHY_STANDUP_STATE/entries/$ts.md"
+    entries=$(jq -c --arg id "$ts" --argjson ts "$ts" --arg date "$day" \
+      '. + [{id:$id, ts:$ts, date:$date, since:"", until:"", agent:"claude",
+             commits:3, repos:1, fallback:false, manual:false, widened:false, warnings:[]}]' \
+      <<<"$entries")
+  done
+  jq -nc --argjson e "$entries" '{entries:$e, lastSeenTs:0}' >"$OMARCHY_STANDUP_STATE/index.json"
+}
+seed_history
+
 OUT=$("$ENGINE" list)
-if (($(jq -r '.entries | length' <<<"$OUT") >= 4)); then ok "entries accumulate"; else no "entries accumulate"; fi
+check "the history lists every entry" "4" "$(jq -r '.entries | length' <<<"$OUT")"
 UNREAD=$(jq -r '.unread' <<<"$OUT")
 if ((UNREAD >= 4)); then ok "everything unread before seen"; else no "everything unread before seen" "got $UNREAD"; fi
 
@@ -254,6 +303,34 @@ if [[ $(jq -r '[.entries[].id] | index("'"$OLD_ID"'")' <<<"$OUT") == "null" ]]; 
 if [[ ! -f $OMARCHY_STANDUP_STATE/entries/$OLD_ID.md ]]; then ok "delete removes the file"; else no "delete removes the file"; fi
 
 echo
+echo "== one standup per day per kind =="
+cat >"$STUB/claude" <<'STUBEOF'
+#!/usr/bin/env bash
+cat >/dev/null
+printf '<standup>\n- a bullet\n</standup>\n'
+STUBEOF
+
+gen_kind() { # gen_kind manual|scheduled
+  local -a extra=()
+  [[ $1 == manual ]] && extra=(--force)
+  PATH="$STUB:$PATH" "$ENGINE" generate --roots "$ROOTS" --window fixed --days 400 \
+    --agent claude "${extra[@]}" >/dev/null
+}
+today_count() { # today_count true|false
+  "$ENGINE" list | jq --argjson m "$1" --arg d "$(date +%Y-%m-%d)" \
+    '[.entries[] | select(.date == $d and (.manual // false) == $m)] | length'
+}
+
+gen_kind scheduled
+gen_kind scheduled
+check "a second scheduled run replaces the first" "1" "$(today_count false)"
+gen_kind manual
+gen_kind manual
+check "a second manual run replaces the first" "1" "$(today_count true)"
+# A manual refresh after the morning run is a deliberate second look, so the
+# two kinds must not evict each other.
+check "manual and scheduled coexist for one day" "1" "$(today_count false)"
+
 echo "== auto window =="
 # After a run, the auto window resumes from where the last one stopped rather
 # than re-reading the same days.

@@ -944,9 +944,15 @@ digest_markdown() {
 DEFAULT_FORMAT="A flat bullet list. One line per bullet, plain past tense."
 
 build_prompt() {
-  local digest=$1 max_bullets=$2 author_mode=$3 format_text=$4
+  local digest=$1 max_bullets=$2 author_mode=$3 format_text=$4 author_count=${5:-1}
+  # A hand-picked list of several people is a team standup exactly as much as
+  # "everyone" is. Describing it as "the developer" told the model to write
+  # about one person, and it obeyed - folding a whole team's work under
+  # whichever name had committed most and dropping the rest.
   local who="the developer"
-  [[ $author_mode == all ]] && who="the team"
+  if [[ $author_mode == all ]] || { [[ $author_mode == custom ]] && ((author_count > 1)); }; then
+    who="the team"
+  fi
   [[ -n $format_text ]] || format_text=$DEFAULT_FORMAT
   cat <<PROMPT
 Write a daily standup update for $who from the git activity below.
@@ -1106,7 +1112,11 @@ cmd_generate() {
     resolved="none"
   elif [[ -n $resolved ]]; then
     local prompt
-    prompt=$(build_prompt "$(digest_markdown "$digest")" "$max_bullets" "$author_mode" "$format_text")
+    local author_count=1
+    [[ $author_mode == custom ]] &&
+      author_count=$(printf '%s\n' "$authors" | tr ',' '\n' | sed '/^[[:space:]]*$/d' | wc -l)
+    prompt=$(build_prompt "$(digest_markdown "$digest")" "$max_bullets" "$author_mode" \
+      "$format_text" "$author_count")
     body=$(run_agent "$resolved" "$custom" "$prompt" | sanitize_output)
   fi
   if [[ -z $body ]]; then
@@ -1129,6 +1139,11 @@ cmd_generate() {
   # repo. The warning rides along with the entry so the panel can say so.
   warnings=$(jq -c '.warnings // []' <<<"$digest")
 
+  # One standup per day per kind. A manual run replaces an earlier manual run
+  # from the same day, and a scheduled run replaces an earlier scheduled one,
+  # so a schedule that fires twice leaves one entry rather than two near
+  # identical ones. The two kinds stay separate: pressing refresh after the
+  # morning run is a deliberate second look, not a duplicate of it.
   jq -c --arg id "$ts" --argjson ts "$ts" --arg date "$(date -d "@$ts" +%Y-%m-%d)" \
     --arg since "$since" --arg until "$until" --arg agent "$resolved" \
     --argjson commits "$count" --argjson repos "$(jq -r '.repoCount' <<<"$digest")" \
@@ -1137,7 +1152,7 @@ cmd_generate() {
     '.entries = ([{id:$id, ts:$ts, date:$date, since:$since, until:$until, agent:$agent,
                    commits:$commits, repos:$repos, fallback:$fallback, manual:$manual,
                    widened:$widened, warnings:$warnings}]
-                 + [.entries[] | select((.manual and $manual and .date == $date) | not)])[:60]' \
+                 + [.entries[] | select((.date == $date and (.manual // false) == $manual) | not)])[:60]' \
     <<<"$(read_index)" | write_atomic "$INDEX_FILE"
 
   prune_entries
