@@ -644,6 +644,12 @@ Panel {
 
               TextField {
                 id: rootsField
+                // The key catcher is blocked while a field has focus, so without this
+                // Escape went nowhere and the panel could not be closed from the keyboard.
+                Keys.onEscapePressed: function(event) {
+                  keyCatcher.forceActiveFocus()
+                  event.accepted = true
+                }
                 width: parent.width
                 text: String(root.cfg.roots)
                 placeholderText: "~/Projects"
@@ -696,6 +702,10 @@ Panel {
 
               TextField {
                 id: reposField
+                Keys.onEscapePressed: function(event) {
+                  keyCatcher.forceActiveFocus()
+                  event.accepted = true
+                }
                 width: parent.width
                 text: String(root.cfg.repos)
                 placeholderText: "~/code/thing, owner/repo"
@@ -735,6 +745,10 @@ Panel {
 
               TextField {
                 id: orgsField
+                Keys.onEscapePressed: function(event) {
+                  keyCatcher.forceActiveFocus()
+                  event.accepted = true
+                }
                 width: parent.width
                 text: String(root.cfg.orgs)
                 placeholderText: "acme-inc"
@@ -875,6 +889,10 @@ Panel {
 
               TextField {
                 id: formatField
+                Keys.onEscapePressed: function(event) {
+                  keyCatcher.forceActiveFocus()
+                  event.accepted = true
+                }
                 width: parent.width
                 text: Model.formatText(root.settings)
                 foreground: root.fg
@@ -918,6 +936,10 @@ Panel {
 
               TextField {
                 id: customField
+                Keys.onEscapePressed: function(event) {
+                  keyCatcher.forceActiveFocus()
+                  event.accepted = true
+                }
                 width: parent.width
                 text: String(root.cfg.customCommand)
                 foreground: root.fg
@@ -985,6 +1007,10 @@ Panel {
 
               TextField {
                 id: timeField
+                Keys.onEscapePressed: function(event) {
+                  keyCatcher.forceActiveFocus()
+                  event.accepted = true
+                }
                 anchors.right: parent.right
                 anchors.verticalCenter: parent.verticalCenter
                 width: Style.space(80)
